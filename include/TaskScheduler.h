@@ -7,12 +7,41 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include "RelayManager.h"
+#include "EnvironmentManager.h"
 
 // Trạng thái của lịch tưới
 enum TaskState {
     IDLE,       // Chưa đến giờ chạy
     RUNNING,    // Đang chạy
     COMPLETED   // Đã hoàn thành
+};
+
+// Cấu trúc điều kiện cảm biến
+struct SensorCondition {
+    bool enabled;                // Có kích hoạt điều kiện này không
+    
+    // Điều kiện nhiệt độ
+    bool temperature_check;      // Có kiểm tra nhiệt độ không
+    float min_temperature;       // Ngưỡng nhiệt độ tối thiểu (°C)
+    float max_temperature;       // Ngưỡng nhiệt độ tối đa (°C)
+    
+    // Điều kiện độ ẩm không khí
+    bool humidity_check;         // Có kiểm tra độ ẩm không khí không
+    float min_humidity;          // Ngưỡng độ ẩm tối thiểu (%)
+    float max_humidity;          // Ngưỡng độ ẩm tối đa (%)
+    
+    // Điều kiện độ ẩm đất
+    bool soil_moisture_check;    // Có kiểm tra độ ẩm đất không
+    float min_soil_moisture;     // Ngưỡng độ ẩm đất tối thiểu (%)
+    
+    // Điều kiện mưa
+    bool rain_check;             // Có kiểm tra mưa không
+    bool skip_when_raining;      // Bỏ qua nếu đang mưa
+    
+    // Điều kiện ánh sáng
+    bool light_check;            // Có kiểm tra ánh sáng không
+    int min_light;               // Ngưỡng ánh sáng tối thiểu (lux)
+    int max_light;               // Ngưỡng ánh sáng tối đa (lux)
 };
 
 // Cấu trúc lịch tưới đơn giản
@@ -30,11 +59,14 @@ struct IrrigationTask {
     TaskState state;            // Trạng thái hiện tại
     time_t start_time;          // Thời gian bắt đầu thực tế
     time_t next_run;            // Thời gian chạy kế tiếp
+    
+    // Điều kiện cảm biến
+    SensorCondition sensor_condition;
 };
 
 class TaskScheduler {
 public:
-    TaskScheduler(RelayManager& relayManager);
+    TaskScheduler(RelayManager& relayManager, EnvironmentManager& envManager);
     
     // Phương thức cơ bản
     void begin();
@@ -49,6 +81,7 @@ public:
     
 private:
     RelayManager& _relayManager;
+    EnvironmentManager& _envManager;
     std::vector<IrrigationTask> _tasks;      // Danh sách lịch
     std::vector<uint8_t> _activeZones;       // Các vùng đang hoạt động
     SemaphoreHandle_t _mutex;
@@ -61,8 +94,13 @@ private:
     bool isHigherPriority(int taskId);       // Kiểm tra độ ưu tiên
     bool isZoneBusy(uint8_t zoneId);         // Kiểm tra vùng có đang chạy
     time_t calculateNextRunTime(IrrigationTask& task); // Tính giờ chạy kế tiếp
+    bool checkSensorConditions(const IrrigationTask& task); // Kiểm tra điều kiện cảm biến
     uint8_t daysArrayToBitmap(JsonArray daysArray); // Chuyển mảng ngày sang bitmap
     JsonArray bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap); // Chuyển bitmap sang mảng ngày
+    
+    // Xử lý JSON
+    void parseSensorCondition(JsonObject& jsonCondition, SensorCondition& condition);
+    void addSensorConditionToJson(JsonDocument& doc, JsonObject& taskObj, const SensorCondition& condition);
 };
 
 #endif // TASK_SCHEDULER_H 

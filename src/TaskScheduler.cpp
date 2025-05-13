@@ -1,6 +1,7 @@
 #include "../include/TaskScheduler.h"
 
-TaskScheduler::TaskScheduler(RelayManager& relayManager) : _relayManager(relayManager) {
+TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& envManager) 
+    : _relayManager(relayManager), _envManager(envManager) {
     _mutex = xSemaphoreCreateMutex();
     _lastCheckTime = 0;
 }
@@ -136,6 +137,11 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
                 strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
                 taskObj["next_run"] = next_run_str;
             }
+            
+            // Thêm thông tin điều kiện cảm biến
+            if (task.sensor_condition.enabled) {
+                addSensorConditionToJson(doc, taskObj, task.sensor_condition);
+            }
         }
         
         xSemaphoreGive(_mutex);
@@ -146,6 +152,64 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
     serializeJson(doc, jsonString);
     
     return jsonString;
+}
+
+void TaskScheduler::addSensorConditionToJson(JsonDocument& doc, JsonObject& taskObj, const SensorCondition& condition) {
+    JsonObject sensorCondition = taskObj.createNestedObject("sensor_condition");
+    sensorCondition["enabled"] = condition.enabled;
+    
+    // Điều kiện nhiệt độ
+    if (condition.temperature_check) {
+        JsonObject temp = sensorCondition.createNestedObject("temperature");
+        temp["enabled"] = true;
+        temp["min"] = condition.min_temperature;
+        temp["max"] = condition.max_temperature;
+    } else {
+        JsonObject temp = sensorCondition.createNestedObject("temperature");
+        temp["enabled"] = false;
+    }
+    
+    // Điều kiện độ ẩm
+    if (condition.humidity_check) {
+        JsonObject humidity = sensorCondition.createNestedObject("humidity");
+        humidity["enabled"] = true;
+        humidity["min"] = condition.min_humidity;
+        humidity["max"] = condition.max_humidity;
+    } else {
+        JsonObject humidity = sensorCondition.createNestedObject("humidity");
+        humidity["enabled"] = false;
+    }
+    
+    // Điều kiện độ ẩm đất
+    if (condition.soil_moisture_check) {
+        JsonObject moisture = sensorCondition.createNestedObject("soil_moisture");
+        moisture["enabled"] = true;
+        moisture["min"] = condition.min_soil_moisture;
+    } else {
+        JsonObject moisture = sensorCondition.createNestedObject("soil_moisture");
+        moisture["enabled"] = false;
+    }
+    
+    // Điều kiện mưa
+    if (condition.rain_check) {
+        JsonObject rain = sensorCondition.createNestedObject("rain");
+        rain["enabled"] = true;
+        rain["skip_when_raining"] = condition.skip_when_raining;
+    } else {
+        JsonObject rain = sensorCondition.createNestedObject("rain");
+        rain["enabled"] = false;
+    }
+    
+    // Điều kiện ánh sáng
+    if (condition.light_check) {
+        JsonObject light = sensorCondition.createNestedObject("light");
+        light["enabled"] = true;
+        light["min"] = condition.min_light;
+        light["max"] = condition.max_light;
+    } else {
+        JsonObject light = sensorCondition.createNestedObject("light");
+        light["enabled"] = false;
+    }
 }
 
 bool TaskScheduler::processCommand(const char* json) {
@@ -219,6 +283,20 @@ bool TaskScheduler::processCommand(const char* json) {
         // Độ ưu tiên (mặc định là 5 nếu không có)
         task.priority = taskJson.containsKey("priority") ? taskJson["priority"] : 5;
         
+        // Khởi tạo các giá trị mặc định cho điều kiện cảm biến
+        task.sensor_condition.enabled = false;
+        task.sensor_condition.temperature_check = false;
+        task.sensor_condition.humidity_check = false;
+        task.sensor_condition.soil_moisture_check = false;
+        task.sensor_condition.rain_check = false;
+        task.sensor_condition.light_check = false;
+        
+        // Xử lý điều kiện cảm biến nếu có
+        if (taskJson.containsKey("sensor_condition")) {
+            JsonObject sensorCondition = taskJson["sensor_condition"];
+            parseSensorCondition(sensorCondition, task.sensor_condition);
+        }
+        
         // Trạng thái mặc định
         task.state = IDLE;
         task.start_time = 0;
@@ -230,6 +308,63 @@ bool TaskScheduler::processCommand(const char* json) {
     }
     
     return anyChanges;
+}
+
+void TaskScheduler::parseSensorCondition(JsonObject& jsonCondition, SensorCondition& condition) {
+    // Điều kiện chính
+    condition.enabled = jsonCondition.containsKey("enabled") ? jsonCondition["enabled"] : false;
+    
+    if (!condition.enabled) {
+        return;
+    }
+    
+    // Điều kiện nhiệt độ
+    if (jsonCondition.containsKey("temperature")) {
+        JsonObject temp = jsonCondition["temperature"];
+        condition.temperature_check = temp.containsKey("enabled") ? temp["enabled"] : false;
+        if (condition.temperature_check) {
+            condition.min_temperature = temp.containsKey("min") ? temp["min"].as<float>() : 0.0;
+            condition.max_temperature = temp.containsKey("max") ? temp["max"].as<float>() : 50.0;
+        }
+    }
+    
+    // Điều kiện độ ẩm
+    if (jsonCondition.containsKey("humidity")) {
+        JsonObject humidity = jsonCondition["humidity"];
+        condition.humidity_check = humidity.containsKey("enabled") ? humidity["enabled"] : false;
+        if (condition.humidity_check) {
+            condition.min_humidity = humidity.containsKey("min") ? humidity["min"].as<float>() : 0.0;
+            condition.max_humidity = humidity.containsKey("max") ? humidity["max"].as<float>() : 100.0;
+        }
+    }
+    
+    // Điều kiện độ ẩm đất
+    if (jsonCondition.containsKey("soil_moisture")) {
+        JsonObject moisture = jsonCondition["soil_moisture"];
+        condition.soil_moisture_check = moisture.containsKey("enabled") ? moisture["enabled"] : false;
+        if (condition.soil_moisture_check) {
+            condition.min_soil_moisture = moisture.containsKey("min") ? moisture["min"].as<float>() : 30.0;
+        }
+    }
+    
+    // Điều kiện mưa
+    if (jsonCondition.containsKey("rain")) {
+        JsonObject rain = jsonCondition["rain"];
+        condition.rain_check = rain.containsKey("enabled") ? rain["enabled"] : false;
+        if (condition.rain_check) {
+            condition.skip_when_raining = rain.containsKey("skip_when_raining") ? rain["skip_when_raining"] : true;
+        }
+    }
+    
+    // Điều kiện ánh sáng
+    if (jsonCondition.containsKey("light")) {
+        JsonObject light = jsonCondition["light"];
+        condition.light_check = light.containsKey("enabled") ? light["enabled"] : false;
+        if (condition.light_check) {
+            condition.min_light = light.containsKey("min") ? light["min"].as<int>() : 0;
+            condition.max_light = light.containsKey("max") ? light["max"].as<int>() : 50000;
+        }
+    }
 }
 
 bool TaskScheduler::processDeleteCommand(const char* json) {
@@ -307,6 +442,11 @@ void TaskScheduler::update() {
             if (isDayMatch && isTimeMatch) {
                 Serial.println("Task " + String(task.id) + " scheduled time match");
                 
+                // Kiểm tra điều kiện cảm biến
+                if (!checkSensorConditions(task)) {
+                    continue; // Bỏ qua lịch này nếu không thỏa mãn điều kiện cảm biến
+                }
+                
                 // Kiểm tra xem có thể chạy ngay không
                 bool canStart = true;
                 
@@ -355,6 +495,68 @@ void TaskScheduler::update() {
         
         xSemaphoreGive(_mutex);
     }
+}
+
+bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
+    if (!task.sensor_condition.enabled) {
+        return true; // Không kích hoạt điều kiện cảm biến, luôn cho phép chạy
+    }
+    
+    const SensorCondition& condition = task.sensor_condition;
+    
+    // Kiểm tra nhiệt độ
+    if (condition.temperature_check) {
+        float temp = _envManager.getTemperature();
+        if (temp < condition.min_temperature || temp > condition.max_temperature) {
+            Serial.println("Task " + String(task.id) + 
+                         " skipped due to temperature out of range: " + String(temp) + "°C");
+            return false;
+        }
+    }
+    
+    // Kiểm tra độ ẩm không khí
+    if (condition.humidity_check) {
+        float humidity = _envManager.getHumidity();
+        if (humidity < condition.min_humidity || humidity > condition.max_humidity) {
+            Serial.println("Task " + String(task.id) + 
+                         " skipped due to humidity out of range: " + String(humidity) + "%");
+            return false;
+        }
+    }
+    
+    // Kiểm tra độ ẩm đất
+    if (condition.soil_moisture_check) {
+        // Kiểm tra tất cả các vùng tưới
+        for (uint8_t zoneId : task.zones) {
+            float moisture = _envManager.getSoilMoisture(zoneId);
+            if (moisture > condition.min_soil_moisture) {
+                Serial.println("Task " + String(task.id) + 
+                             " skipped due to soil moisture above threshold: " + 
+                             String(moisture) + "% in zone " + String(zoneId));
+                return false;
+            }
+        }
+    }
+    
+    // Kiểm tra mưa
+    if (condition.rain_check && condition.skip_when_raining) {
+        if (_envManager.isRaining()) {
+            Serial.println("Task " + String(task.id) + " skipped due to rain");
+            return false;
+        }
+    }
+    
+    // Kiểm tra ánh sáng
+    if (condition.light_check) {
+        int light = _envManager.getLightLevel();
+        if (light < condition.min_light || light > condition.max_light) {
+            Serial.println("Task " + String(task.id) + 
+                         " skipped due to light level out of range: " + String(light) + " lux");
+            return false;
+        }
+    }
+    
+    return true; // Tất cả điều kiện đều thỏa mãn
 }
 
 void TaskScheduler::startTask(IrrigationTask& task) {

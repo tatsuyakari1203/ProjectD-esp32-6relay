@@ -1,0 +1,92 @@
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "tasks": [
+    {
+      "id": 1,
+      "active": true,
+      "days": [1, 3, 5],
+      "time": "10:32",
+      "duration": 15,
+      "zones": [1, 2],
+      "priority": 5,
+      "sensor_condition": {
+        "enabled": true,
+        "temperature": {
+          "enabled": true,
+          "min": 20,
+          "max": 38
+        },
+        "humidity": {
+          "enabled": true,
+          "min": 40,
+          "max": 80
+        },
+        "soil_moisture": {
+          "enabled": true,
+          "min": 30
+        },
+        "rain": {
+          "enabled": true,
+          "skip_when_raining": true
+        },
+        "light": {
+          "enabled": false
+        }
+      }
+    }
+  ]
+}
+
+// Cập nhật giá trị cảm biến độ ẩm đất cho vùng 1
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "soil_moisture": {
+    "zone": 1,
+    "value": 25
+  }
+}
+
+// Cập nhật trạng thái mưa
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "rain": true
+}
+
+// Cập nhật độ sáng
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "light": 5000
+}
+
+// Cập nhật nhiều cảm biến cùng lúc
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "soil_moisture": {
+    "zone": 2,
+    "value": 20
+  },
+  "rain": false,
+  "light": 10000
+}
+
+// Tạo lịch tưới đơn giản không có điều kiện cảm biến
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "tasks": [
+    {
+      "id": 2,
+      "active": true,
+      "days": [2, 4, 6],
+      "time": "06:00",
+      "duration": 10,
+      "zones": [3, 4],
+      "priority": 3
+    }
+  ]
+}
+
+// Xóa lịch tưới
+{
+  "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
+  "delete_tasks": [1, 2]
+} 

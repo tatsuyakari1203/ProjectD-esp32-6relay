@@ -4,6 +4,7 @@
 #include "../include/NetworkManager.h"
 #include "../include/RelayManager.h"
 #include "../include/TaskScheduler.h"
+#include "../include/EnvironmentManager.h"
 #include <time.h>
 
 // Function prototypes
@@ -51,6 +52,7 @@ const char* MQTT_TOPIC_CONTROL = "irrigation/esp32_6relay/control";
 const char* MQTT_TOPIC_STATUS = "irrigation/esp32_6relay/status";
 const char* MQTT_TOPIC_SCHEDULE = "irrigation/esp32_6relay/schedule";
 const char* MQTT_TOPIC_SCHEDULE_STATUS = "irrigation/esp32_6relay/schedule/status";
+const char* MQTT_TOPIC_ENV_CONTROL = "irrigation/esp32_6relay/environment";
 
 // NTP configuration
 const char* NTP_SERVER = "pool.ntp.org";
@@ -60,7 +62,8 @@ const char* TZ_INFO = "Asia/Ho_Chi_Minh";  // Vietnam timezone
 SensorManager sensorManager;
 NetworkManager networkManager;
 RelayManager relayManager;
-TaskScheduler taskScheduler(relayManager);
+EnvironmentManager envManager(sensorManager);
+TaskScheduler taskScheduler(relayManager, envManager);
 
 // Time tracking variables
 unsigned long lastSensorReadTime = 0;
@@ -69,6 +72,8 @@ unsigned long lastStatusReportTime = 0;
 const unsigned long statusReportInterval = 10000;  // Send status every 10 seconds
 unsigned long lastScheduleCheckTime = 0;
 const unsigned long scheduleCheckInterval = 1000;  // Check schedule every 1 second
+unsigned long lastEnvUpdateTime = 0;
+const unsigned long envUpdateInterval = 2000;  // Update environment readings every 2 seconds
 
 // LED status tracking
 bool ledState = false;
@@ -127,6 +132,34 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
     }
   }
+  else if (strcmp(topic, MQTT_TOPIC_ENV_CONTROL) == 0) {
+    // Process environment control command
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, message);
+    
+    if (error) {
+      Serial.println("JSON parsing failed: " + String(error.c_str()));
+      return;
+    }
+    
+    // Xử lý cập nhật giá trị cảm biến thủ công
+    if (doc.containsKey("soil_moisture")) {
+      JsonObject soil = doc["soil_moisture"];
+      int zone = soil["zone"];
+      float value = soil["value"];
+      envManager.setSoilMoisture(zone, value);
+    }
+    
+    if (doc.containsKey("rain")) {
+      bool isRaining = doc["rain"];
+      envManager.setRainStatus(isRaining);
+    }
+    
+    if (doc.containsKey("light")) {
+      int lightLevel = doc["light"];
+      envManager.setLightLevel(lightLevel);
+    }
+  }
 }
 
 // Core 0 Task - Handles sensors, network, MQTT (preemptive)
@@ -138,6 +171,12 @@ void Core0TaskCode(void * parameter) {
     networkManager.loop();
     
     unsigned long currentTime = millis();
+    
+    // Update environment manager
+    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
+      lastEnvUpdateTime = currentTime;
+      envManager.update();
+    }
     
     // Read data from sensors and send to MQTT server
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
@@ -302,6 +341,13 @@ void setup() {
       Serial.println("Subscribed to schedule topic: " + String(MQTT_TOPIC_SCHEDULE));
     } else {
       Serial.println("Failed to subscribe to schedule topic");
+    }
+    
+    // Subscribe to environment control topic
+    if (networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL)) {
+      Serial.println("Subscribed to environment control topic: " + String(MQTT_TOPIC_ENV_CONTROL));
+    } else {
+      Serial.println("Failed to subscribe to environment control topic");
     }
     
     // Green LED to indicate successful connection
