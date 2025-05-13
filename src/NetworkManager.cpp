@@ -1,6 +1,6 @@
 #include "../include/NetworkManager.h"
 
-NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) {
+NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) { // 7 hours offset for Vietnam
     _wifiConnected = false;
     _mqttConnected = false;
     _timeSync = false;
@@ -222,8 +222,10 @@ bool NetworkManager::syncTime() {
     }
     
     if (retries < 3) {
-        // Synchronize time with system
+        // Synchronize time with system for Vietnam timezone
         configTime(7 * 3600, 0, "pool.ntp.org");
+        setenv("TZ", "Asia/Ho_Chi_Minh", 1);
+        tzset();
         return true;
     }
     

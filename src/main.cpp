@@ -3,6 +3,7 @@
 #include "../include/SensorManager.h"
 #include "../include/NetworkManager.h"
 #include "../include/RelayManager.h"
+#include "../include/TaskScheduler.h"
 #include <time.h>
 
 // Function prototypes
@@ -48,23 +49,26 @@ const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Provided API k
 const char* MQTT_TOPIC_SENSORS = "irrigation/esp32_6relay/sensors";
 const char* MQTT_TOPIC_CONTROL = "irrigation/esp32_6relay/control";
 const char* MQTT_TOPIC_STATUS = "irrigation/esp32_6relay/status";
+const char* MQTT_TOPIC_SCHEDULE = "irrigation/esp32_6relay/schedule";
+const char* MQTT_TOPIC_SCHEDULE_STATUS = "irrigation/esp32_6relay/schedule/status";
 
 // NTP configuration
 const char* NTP_SERVER = "pool.ntp.org";
-const char* TZ_INFO = "GMT+7";  // Vietnam timezone (GMT+7)
+const char* TZ_INFO = "Asia/Ho_Chi_Minh";  // Vietnam timezone
 
 // Sensor and manager objects
 SensorManager sensorManager;
 NetworkManager networkManager;
 RelayManager relayManager;
+TaskScheduler taskScheduler(relayManager);
 
 // Time tracking variables
 unsigned long lastSensorReadTime = 0;
 const unsigned long sensorReadInterval = 5000;  // Read sensors and send data every 5 seconds
-unsigned long lastTimeCheckTime = 0;
-const unsigned long timeCheckInterval = 5000;  // Check time every 5 seconds
 unsigned long lastStatusReportTime = 0;
 const unsigned long statusReportInterval = 10000;  // Send status every 10 seconds
+unsigned long lastScheduleCheckTime = 0;
+const unsigned long scheduleCheckInterval = 1000;  // Check schedule every 1 second
 
 // LED status tracking
 bool ledState = false;
@@ -86,6 +90,13 @@ void printLocalTime() {
   strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
   Serial.print("Current time: ");
   Serial.println(timeString);
+  
+  // Print timezone information
+  Serial.print("Timezone: ");
+  Serial.print(TZ_INFO);
+  Serial.print(" (Day of week: ");
+  Serial.print(timeinfo.tm_wday);  // 0 is Sunday
+  Serial.println(")");
 }
 
 // MQTT callback function
@@ -106,6 +117,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       // If command was processed successfully, publish status
       String statusPayload = relayManager.getStatusJson(API_KEY);
       networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
+    }
+  }
+  else if (strcmp(topic, MQTT_TOPIC_SCHEDULE) == 0) {
+    // Process scheduling command
+    if (taskScheduler.processCommand(message)) {
+      // If schedule was processed successfully, publish schedule status
+      String schedulePayload = taskScheduler.getTasksJson(API_KEY);
+      networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
     }
   }
 }
@@ -169,9 +188,20 @@ void Core0TaskCode(void * parameter) {
       lastStatusReportTime = currentTime;
       
       if (networkManager.isConnected()) {
+        // Send relay status
         String statusPayload = relayManager.getStatusJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
+        
+        // Send schedule status
+        String schedulePayload = taskScheduler.getTasksJson(API_KEY);
+        networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
       }
+    }
+    
+    // Check and update irrigation schedules
+    if (currentTime - lastScheduleCheckTime >= scheduleCheckInterval) {
+      lastScheduleCheckTime = currentTime;
+      taskScheduler.update();
     }
     
     // Blink LED to show activity status
@@ -241,6 +271,9 @@ void setup() {
   // Initialize relay manager
   relayManager.begin(relayPins, numRelays);
   
+  // Initialize task scheduler
+  taskScheduler.begin();
+  
   // Initialize sensors
   sensorManager.begin();
   
@@ -248,18 +281,27 @@ void setup() {
   if (networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
     Serial.println("Network connection successful");
     
-    // Configure NTP time
-    configTime(0, 0, NTP_SERVER);
-    setenv("TZ", TZ_INFO, 1);
+    // Configure NTP time for Vietnam timezone (GMT+7)
+    configTime(7 * 3600, 0, NTP_SERVER); // 7 hours offset for Vietnam
+    setenv("TZ", "Asia/Ho_Chi_Minh", 1); // Set Vietnam timezone
     tzset();
-    Serial.println("NTP Server configured: " + String(NTP_SERVER));
+    Serial.println("NTP Server configured: " + String(NTP_SERVER) + " with Vietnam timezone");
     
-    // Set MQTT callback and subscribe to control topic
+    // Set MQTT callback and subscribe to control topics
     networkManager.setCallback(mqttCallback);
+    
+    // Subscribe to relay control topic
     if (networkManager.subscribe(MQTT_TOPIC_CONTROL)) {
       Serial.println("Subscribed to control topic: " + String(MQTT_TOPIC_CONTROL));
     } else {
       Serial.println("Failed to subscribe to control topic");
+    }
+    
+    // Subscribe to schedule topic
+    if (networkManager.subscribe(MQTT_TOPIC_SCHEDULE)) {
+      Serial.println("Subscribed to schedule topic: " + String(MQTT_TOPIC_SCHEDULE));
+    } else {
+      Serial.println("Failed to subscribe to schedule topic");
     }
     
     // Green LED to indicate successful connection
