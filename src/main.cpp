@@ -2,14 +2,14 @@
 #include "../include/WS_GPIO.h"
 #include "../include/SensorManager.h"
 #include "../include/NetworkManager.h"
+#include "../include/RelayManager.h"
 #include <time.h>
 
 // Function prototypes
 void Core0TaskCode(void * parameter);
 void Core1TaskCode(void * parameter);
 void printLocalTime();
-void startIrrigation(int zone, unsigned long duration);
-void stopIrrigation(int zone);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // Core task definitions
 TaskHandle_t core0Task;  // Preemptive tasks: sensors, MQTT, scheduling
@@ -45,35 +45,34 @@ const int MQTT_PORT = 1883;
 const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Provided API key
 
 // MQTT topic configuration
-const char* MQTT_TOPIC = "irrigation/esp32_6relay/sensors";
+const char* MQTT_TOPIC_SENSORS = "irrigation/esp32_6relay/sensors";
+const char* MQTT_TOPIC_CONTROL = "irrigation/esp32_6relay/control";
+const char* MQTT_TOPIC_STATUS = "irrigation/esp32_6relay/status";
 
 // NTP configuration
 const char* NTP_SERVER = "pool.ntp.org";
 const char* TZ_INFO = "GMT+7";  // Vietnam timezone (GMT+7)
 
-// Sensor and network management objects
+// Sensor and manager objects
 SensorManager sensorManager;
 NetworkManager networkManager;
+RelayManager relayManager;
 
 // Time tracking variables
 unsigned long lastSensorReadTime = 0;
 const unsigned long sensorReadInterval = 5000;  // Read sensors and send data every 5 seconds
 unsigned long lastTimeCheckTime = 0;
 const unsigned long timeCheckInterval = 5000;  // Check time every 5 seconds
+unsigned long lastStatusReportTime = 0;
+const unsigned long statusReportInterval = 10000;  // Send status every 10 seconds
 
 // LED status tracking
 bool ledState = false;
 unsigned long lastLedBlinkTime = 0;
 const unsigned long ledBlinkInterval = 1000;  // Blink LED every 1 second
 
-// Relay control variables
-bool irrigationActive = false;
-unsigned long irrigationStartTime = 0;
-unsigned long irrigationDuration = 0;  // Duration in milliseconds
-
 // Semaphores for safe access to shared resources
 SemaphoreHandle_t sensorDataMutex;
-SemaphoreHandle_t irrigationControlMutex;
 
 // Function to display current time
 void printLocalTime() {
@@ -89,34 +88,25 @@ void printLocalTime() {
   Serial.println(timeString);
 }
 
-// Function to control irrigation system
-void startIrrigation(int zone, unsigned long duration) {
-  if (xSemaphoreTake(irrigationControlMutex, portMAX_DELAY)) {
-    irrigationActive = true;
-    irrigationStartTime = millis();
-    irrigationDuration = duration;
-    
-    // Turn on the selected relay/zone
-    if (zone >= 0 && zone < numRelays) {
-      digitalWrite(relayPins[zone], HIGH);
-      Serial.println("Started irrigation on zone " + String(zone) + " for " + String(duration/1000) + " seconds");
+// MQTT callback function
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Convert payload to string
+  char message[length + 1];
+  memcpy(message, payload, length);
+  message[length] = '\0';
+  
+  Serial.println("Received MQTT message:");
+  Serial.println("- Topic: " + String(topic));
+  Serial.println("- Payload: " + String(message));
+  
+  // Process message based on topic
+  if (strcmp(topic, MQTT_TOPIC_CONTROL) == 0) {
+    // Process relay control command
+    if (relayManager.processCommand(message)) {
+      // If command was processed successfully, publish status
+      String statusPayload = relayManager.getStatusJson(API_KEY);
+      networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
     }
-    
-    xSemaphoreGive(irrigationControlMutex);
-  }
-}
-
-void stopIrrigation(int zone) {
-  if (xSemaphoreTake(irrigationControlMutex, portMAX_DELAY)) {
-    irrigationActive = false;
-    
-    // Turn off the selected relay/zone
-    if (zone >= 0 && zone < numRelays) {
-      digitalWrite(relayPins[zone], LOW);
-      Serial.println("Stopped irrigation on zone " + String(zone));
-    }
-    
-    xSemaphoreGive(irrigationControlMutex);
   }
 }
 
@@ -130,7 +120,7 @@ void Core0TaskCode(void * parameter) {
     
     unsigned long currentTime = millis();
     
-    // Read data from sensors and send to MQTT server every 5 seconds
+    // Read data from sensors and send to MQTT server
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
       lastSensorReadTime = currentTime;
       
@@ -155,44 +145,10 @@ void Core0TaskCode(void * parameter) {
             // Create JSON payload
             String payload = sensorManager.getJsonPayload(API_KEY);
             
-            // Send to MQTT server and check detailed status
-            int publishResult = networkManager.publish(MQTT_TOPIC, payload.c_str());
-            if (publishResult) {
-              Serial.println("SUCCESS: Data sent to MQTT server");
-              
-              // Green LED blink when sending successful
-              RGB_Light(0, 255, 0);
-              delay(100);
-              RGB_Light(0, 0, 0);
-            } else {
-              Serial.println("ERROR: Failed to send data to MQTT server");
-              Serial.println("MQTT Error Details:");
-              Serial.println("- Connection state: " + String(networkManager.isConnected() ? "Connected" : "Disconnected"));
-              Serial.println("- Topic: " + String(MQTT_TOPIC));
-              Serial.println("- Payload size: " + String(payload.length()) + " bytes");
-              Serial.println("- Payload: " + payload);
-              
-              // Try to diagnose the issue
-              int mqttState = networkManager.getMqttState();
-              Serial.println("- MQTT state code: " + String(mqttState));
-              
-              // Print possible solutions
-              Serial.println("Possible solutions:");
-              Serial.println("- Check MQTT server availability");
-              Serial.println("- Verify server credentials and permissions");
-              Serial.println("- Check network connectivity");
-              Serial.println("- Restart the device if issues persist");
-              
-              // Red LED blink when sending failed
-              RGB_Light(255, 0, 0);
-              delay(100);
-              RGB_Light(0, 0, 0);
-            }
+            // Send to MQTT server
+            networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
           } else {
             Serial.println("ERROR: No network connection, cannot send data");
-            Serial.println("- Check WiFi signal strength");
-            Serial.println("- Check if router is functioning");
-            Serial.println("- Try moving the device closer to WiFi router");
             
             // Red LED blink when no connection
             RGB_Light(255, 0, 0);
@@ -201,13 +157,20 @@ void Core0TaskCode(void * parameter) {
           }
         } else {
           Serial.println("ERROR: Failed to read from sensors");
-          Serial.println("- Check sensor connections");
-          Serial.println("- Verify DHT21 is correctly powered");
-          Serial.println("- Make sure data pin is connected to GPIO" + String(DHT_PIN));
         }
         
         // Release mutex after accessing sensor data
         xSemaphoreGive(sensorDataMutex);
+      }
+    }
+    
+    // Send relay status periodically
+    if (currentTime - lastStatusReportTime >= statusReportInterval) {
+      lastStatusReportTime = currentTime;
+      
+      if (networkManager.isConnected()) {
+        String statusPayload = relayManager.getStatusJson(API_KEY);
+        networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
       }
     }
     
@@ -244,24 +207,8 @@ void Core1TaskCode(void * parameter) {
   Serial.println("Core 1 Task started on core " + String(xPortGetCoreID()));
   
   for(;;) {
-    // Handle irrigation control
-    if (xSemaphoreTake(irrigationControlMutex, portMAX_DELAY)) {
-      if (irrigationActive) {
-        unsigned long currentTime = millis();
-        
-        // Check if irrigation should stop
-        if (currentTime - irrigationStartTime >= irrigationDuration) {
-          // Find which zone is active and stop it
-          for (int i = 0; i < numRelays; i++) {
-            if (digitalRead(relayPins[i]) == HIGH) {
-              stopIrrigation(i);
-              break;
-            }
-          }
-        }
-      }
-      xSemaphoreGive(irrigationControlMutex);
-    }
+    // Update relay manager to handle timer-based relay control
+    relayManager.update();
     
     // This is a non-preemptive task, so we can have longer delay
     vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -284,26 +231,15 @@ void setup() {
   Serial.println("ESP32-S3 Dual-Core Irrigation System");
   Serial.println("=============================================");
   
-  // Create semaphores before starting tasks
+  // Create semaphore
   sensorDataMutex = xSemaphoreCreateMutex();
-  irrigationControlMutex = xSemaphoreCreateMutex();
-  
-  // Print connection pin information
-  Serial.println("DHT21 connection pin: GPIO" + String(DHT_PIN));
-  Serial.println("Please ensure the sensor is connected correctly:");
-  Serial.println("- VCC: 3.3V or 5V");
-  Serial.println("- GND: GND");
-  Serial.println("- DATA: GPIO" + String(DHT_PIN));
   
   // Initialize GPIO
   GPIO_Init();
   Serial.println("GPIO initialized");
   
-  // Turn off all relays initially
-  for (int i = 0; i < numRelays; i++) {
-    digitalWrite(relayPins[i], LOW);
-  }
-  Serial.println("All relays turned off");
+  // Initialize relay manager
+  relayManager.begin(relayPins, numRelays);
   
   // Initialize sensors
   sensorManager.begin();
@@ -318,6 +254,14 @@ void setup() {
     tzset();
     Serial.println("NTP Server configured: " + String(NTP_SERVER));
     
+    // Set MQTT callback and subscribe to control topic
+    networkManager.setCallback(mqttCallback);
+    if (networkManager.subscribe(MQTT_TOPIC_CONTROL)) {
+      Serial.println("Subscribed to control topic: " + String(MQTT_TOPIC_CONTROL));
+    } else {
+      Serial.println("Failed to subscribe to control topic");
+    }
+    
     // Green LED to indicate successful connection
     RGB_Light(0, 255, 0);
     delay(1000);
@@ -327,9 +271,6 @@ void setup() {
     Buzzer_PWM(300);
   } else {
     Serial.println("ERROR: Network connection failed");
-    Serial.println("- Check WiFi credentials");
-    Serial.println("- Check if WiFi network is available");
-    Serial.println("- Check if the router is on and functioning");
     
     // Red LED to indicate connection failure
     RGB_Light(255, 0, 0);
@@ -360,11 +301,8 @@ void setup() {
   delay(500);
   Serial.println("Tasks created and running");
   Serial.println("Core 0: Handling sensors, MQTT, scheduling (preemptive)");
-  Serial.println("Core 1: Handling irrigation control (non-preemptive)");
+  Serial.println("Core 1: Handling relay control (non-preemptive)");
   Serial.println("System ready");
-  
-  // Test irrigation control (uncomment for testing)
-  // startIrrigation(0, 10000); // Start irrigation on zone 0 for 10 seconds
 }
 
 void loop() {

@@ -162,6 +162,32 @@ bool NetworkManager::publish(const char* topic, const char* payload) {
     return success;
 }
 
+bool NetworkManager::subscribe(const char* topic) {
+    if (!_mqttConnected && !reconnect()) {
+        Serial.println("ERROR: MQTT not connected and reconnect failed");
+        return false;
+    }
+    
+    // Log the subscribe attempt
+    Serial.println("Subscribing to MQTT topic: " + String(topic));
+    
+    // Subscribe to the topic
+    bool success = _mqttClient.subscribe(topic);
+    
+    if (success) {
+        Serial.println("Successfully subscribed to topic: " + String(topic));
+    } else {
+        Serial.println("Failed to subscribe to topic. MQTT state: " + String(_mqttClient.state()));
+    }
+    
+    return success;
+}
+
+void NetworkManager::setCallback(MqttCallback callback) {
+    _mqttClient.setCallback(callback);
+    Serial.println("MQTT callback set");
+}
+
 bool NetworkManager::isConnected() {
     return _wifiConnected && _mqttConnected;
 }
