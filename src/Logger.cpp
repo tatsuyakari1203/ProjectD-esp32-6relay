@@ -5,7 +5,10 @@
 // Define the global AppLogger variable
 Logger AppLogger;
 
-Logger::Logger() : _networkManager(nullptr), _serialLogLevel(LOG_LEVEL_NONE), _mqttLogLevel(LOG_LEVEL_NONE) {
+// API key from main.cpp
+extern const char* API_KEY;
+
+Logger::Logger() : _networkManager(nullptr), _serialLogLevel(LOG_LEVEL_NONE), _mqttLogLevel(LOG_LEVEL_NONE), _apiKey(nullptr) {
     // Default constructor
 }
 
@@ -14,6 +17,9 @@ void Logger::begin(NetworkManager* networkManager, LogLevel initialSerialLogLeve
     setSerialLogLevel(initialSerialLogLevel); // Use setter to get a log message for the change
     setMqttLogLevel(initialMqttLogLevel);   // Use setter
 
+    // Store API key from main.cpp
+    _apiKey = API_KEY;
+    
     // Log Logger initialization message (will only appear if Serial is configured for INFO level or higher)
     // and Serial.begin() has been called.
     if (_serialLogLevel >= LOG_LEVEL_INFO && Serial) {
@@ -120,14 +126,22 @@ void Logger::processLogEntry(const LogEntry& entry) {
 // Function to convert LogEntry to JSON string for MQTT
 String Logger::formatToJson(const LogEntry& entry) {
     StaticJsonDocument<512> doc; // JSON size, adjust if more fields are needed
+    
+    // Add API key for authentication
+    if (_apiKey != nullptr) {
+        doc["api_key"] = _apiKey;
+    }
+    
     doc["timestamp"] = entry.timestamp;
     doc["level_num"] = static_cast<int>(entry.level); // Send numeric level
     doc["level_str"] = levelToString(entry.level);   // and string level for readability
     doc["tag"] = entry.tag;
     doc["message"] = entry.message;
-    // Other useful information can be added:
-    // doc["core_id"] = xPortGetCoreID();
-    // doc["free_heap"] = ESP.getFreeHeap();
+    
+    // --- NEW: Add Core ID and Free Heap ---
+    doc["core_id"] = xPortGetCoreID();
+    doc["free_heap"] = ESP.getFreeHeap();
+    // --- END NEW ---
 
     String output;
     serializeJson(doc, output); // Convert JSON object to string
@@ -171,4 +185,79 @@ LogLevel Logger::getSerialLogLevel() const {
 
 LogLevel Logger::getMqttLogLevel() const {
     return _mqttLogLevel;
-} 
+}
+
+// --- NEW: Performance Logging Function Implementation ---
+void Logger::perf(const String& tag, const String& eventName, unsigned long durationMs, bool success, const String& details) {
+    // Performance logs are typically INFO or DEBUG level. Let's use INFO.
+    // You can make the level a parameter if more flexibility is needed.
+    LogLevel level = LOG_LEVEL_INFO;
+
+    bool shouldLogSerial = (level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE);
+    bool shouldLogMqtt = (level <= _mqttLogLevel && _mqttLogLevel != LOG_LEVEL_NONE);
+
+    if (!shouldLogSerial && !shouldLogMqtt) {
+        return; // No target wants to log at this level
+    }
+
+    // Create the main message part
+    String perfMessage = "PERF: Event='" + eventName + "', Duration=" + String(durationMs) + "ms, Success=" + (success ? "true" : "false");
+    if (!details.isEmpty()) {
+        perfMessage += ", Details='" + details + "'";
+    }
+
+    // For Serial, just print the composed message
+    if (shouldLogSerial && Serial) {
+        LogEntry entry;
+        if (time(nullptr) > 1000000000L) {
+            entry.timestamp = time(nullptr);
+        } else {
+            entry.timestamp = millis();
+        }
+        entry.level = level;
+        entry.tag = tag; // Use the provided tag
+        entry.message = perfMessage;
+
+        // Directly format for serial to include core_id and free_heap contextually for this specific log
+        String logString = String(entry.timestamp) + " [" + levelToString(entry.level) + "]";
+        logString += " [" + entry.tag + "]";
+        logString += " [Core:" + String(xPortGetCoreID()) + ", Heap:" + String(ESP.getFreeHeap()) + "]"; // Add context here too
+        logString += ": " + entry.message;
+        Serial.println(logString);
+    }
+
+    // For MQTT, create a structured JSON payload
+    if (shouldLogMqtt && _networkManager && _networkManager->isConnected()) {
+        StaticJsonDocument<512> doc; // Adjust size as needed
+        
+        // Add API key for authentication
+        if (_apiKey != nullptr) {
+            doc["api_key"] = _apiKey;
+        }
+        
+        if (time(nullptr) > 1000000000L) {
+            doc["timestamp"] = time(nullptr);
+        } else {
+            doc["timestamp"] = millis();
+        }
+        doc["level_num"] = static_cast<int>(level);
+        doc["level_str"] = levelToString(level); // Or a dedicated "PERF" level string
+        doc["tag"] = tag;
+        // Differentiate performance logs, e.g., by adding a "type" field or specific structure
+        doc["type"] = "performance";
+        doc["event_name"] = eventName;
+        doc["duration_ms"] = durationMs;
+        doc["success"] = success;
+        if (!details.isEmpty()) {
+            doc["details"] = details;
+        }
+        doc["core_id"] = xPortGetCoreID();
+        doc["free_heap"] = ESP.getFreeHeap();
+
+        String mqttPayload;
+        serializeJson(doc, mqttPayload);
+        _networkManager->publish(_mqttLogTopic, mqttPayload.c_str()); // Assuming _mqttLogTopic is your general log topic
+                                                                    // Consider a dedicated topic for performance logs if volume is high.
+    }
+}
+// --- END NEW --- 

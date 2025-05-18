@@ -1,4 +1,5 @@
 #include "../include/EnvironmentManager.h"
+#include "../include/Logger.h"
 
 EnvironmentManager::EnvironmentManager(SensorManager& sensorManager) : _sensorManager(sensorManager) {
     _temperature = 0.0;
@@ -77,16 +78,16 @@ void EnvironmentManager::setCurrentHeatIndex(float hi) {
 void EnvironmentManager::setSoilMoisture(int zone, float value) {
     if (zone >= 1 && zone <= 6) {
         _soilMoisture[zone] = value;
-        Serial.println("Set soil moisture for zone " + String(zone) + " to " + String(value) + "%");
+        AppLogger.info("EnvMgr", "Set soil moisture for zone " + String(zone) + " to " + String(value) + "%");
     }
 }
 
 void EnvironmentManager::setRainStatus(bool isRaining) {
     _isRaining = isRaining;
-    Serial.println("Set rain status to " + String(isRaining ? "raining" : "not raining"));
+    AppLogger.info("EnvMgr", "Set rain status to " + String(isRaining ? "raining" : "not raining"));
 }
 
 void EnvironmentManager::setLightLevel(int level) {
     _lightLevel = level;
-    Serial.println("Set light level to " + String(level) + " lux");
+    AppLogger.info("EnvMgr", "Set light level to " + String(level) + " lux");
 } 

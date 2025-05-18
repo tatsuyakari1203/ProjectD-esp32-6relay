@@ -7,6 +7,23 @@
 #include "../include/EnvironmentManager.h"
 #include "../include/Logger.h"
 #include <time.h>
+#include <Preferences.h>
+
+// THÊM VÀO: Hằng số cho JSON keys
+static const char* JSON_KEY_SOIL_MOISTURE = "soil_moisture";
+static const char* JSON_KEY_ZONE = "zone";
+static const char* JSON_KEY_VALUE = "value";
+static const char* JSON_KEY_RAIN = "rain";
+static const char* JSON_KEY_LIGHT = "light";
+static const char* JSON_KEY_TARGET = "target";
+static const char* JSON_KEY_LEVEL = "level";
+static const char* JSON_KEY_SERIAL = "serial";
+static const char* JSON_KEY_MQTT = "mqtt";
+static const char* JSON_KEY_CRITICAL = "CRITICAL";
+static const char* JSON_KEY_ERROR = "ERROR";
+static const char* JSON_KEY_WARNING = "WARNING";
+static const char* JSON_KEY_INFO = "INFO";
+static const char* JSON_KEY_DEBUG = "DEBUG";
 
 // Function prototypes
 void Core0TaskCode(void * parameter);
@@ -71,7 +88,7 @@ TaskScheduler taskScheduler(relayManager, envManager);
 
 // Time tracking variables
 unsigned long lastSensorReadTime = 0;
-const unsigned long sensorReadInterval = 5000;  // Read sensors and send data every 5 seconds
+const unsigned long sensorReadInterval = 30000;  // Read sensors and send data every 30 seconds
 unsigned long lastForcedStatusReportTime = 0;
 const unsigned long forcedStatusReportInterval = 5 * 60 * 1000;  // Force status update every 5 minutes
 unsigned long lastEnvUpdateTime = 0;
@@ -121,7 +138,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   else if (strcmp(topic, MQTT_TOPIC_ENV_CONTROL) == 0) {
     // Process environment control command
-    DynamicJsonDocument doc(512);
+    StaticJsonDocument<256> doc; // Ước tính kích thước đủ cho payload này
     DeserializationError error = deserializeJson(doc, message);
     
     if (error) {
@@ -130,22 +147,22 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     
     // Xử lý cập nhật giá trị cảm biến thủ công
-    if (doc.containsKey("soil_moisture")) {
-      JsonObject soil = doc["soil_moisture"];
-      int zone = soil["zone"];
-      float value = soil["value"];
+    if (doc.containsKey(JSON_KEY_SOIL_MOISTURE)) {
+      JsonObject soil = doc[JSON_KEY_SOIL_MOISTURE];
+      int zone = soil[JSON_KEY_ZONE];
+      float value = soil[JSON_KEY_VALUE];
       envManager.setSoilMoisture(zone, value);
       AppLogger.info("MQTTCallbk", "Manual soil moisture update: Zone " + String(zone) + ", Value: " + String(value));
     }
     
-    if (doc.containsKey("rain")) {
-      bool isRaining = doc["rain"];
+    if (doc.containsKey(JSON_KEY_RAIN)) {
+      bool isRaining = doc[JSON_KEY_RAIN];
       envManager.setRainStatus(isRaining);
       AppLogger.info("MQTTCallbk", "Manual rain status update: " + String(isRaining ? "Raining" : "Not raining"));
     }
     
-    if (doc.containsKey("light")) {
-      int lightLevel = doc["light"];
+    if (doc.containsKey(JSON_KEY_LIGHT)) {
+      int lightLevel = doc[JSON_KEY_LIGHT];
       envManager.setLightLevel(lightLevel);
       AppLogger.info("MQTTCallbk", "Manual light level update: " + String(lightLevel));
     }
@@ -154,7 +171,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // Process log configuration command
     AppLogger.info("MQTTCallbk", "Received log configuration command. Payload: " + String(message));
 
-    DynamicJsonDocument doc(256); // Small payload for config
+    StaticJsonDocument<128> doc; // Kích thước này đủ cho target và level
     DeserializationError error = deserializeJson(doc, message);
 
     if (error) {
@@ -162,21 +179,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       return;
     }
 
-    const char* target = doc["target"]; // "serial" or "mqtt"
-    const char* levelStr = doc["level"];  // "NONE", "CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"
+    const char* target = doc[JSON_KEY_TARGET]; // "serial" or "mqtt"
+    const char* levelStr = doc[JSON_KEY_LEVEL];  // "NONE", "CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"
 
     if (target && levelStr) {
       LogLevel newLevel = LOG_LEVEL_NONE; // Default
-      if (strcmp(levelStr, "CRITICAL") == 0) newLevel = LOG_LEVEL_CRITICAL;
-      else if (strcmp(levelStr, "ERROR") == 0) newLevel = LOG_LEVEL_ERROR;
-      else if (strcmp(levelStr, "WARNING") == 0) newLevel = LOG_LEVEL_WARNING;
-      else if (strcmp(levelStr, "INFO") == 0) newLevel = LOG_LEVEL_INFO;
-      else if (strcmp(levelStr, "DEBUG") == 0) newLevel = LOG_LEVEL_DEBUG;
+      if (strcmp(levelStr, JSON_KEY_CRITICAL) == 0) newLevel = LOG_LEVEL_CRITICAL;
+      else if (strcmp(levelStr, JSON_KEY_ERROR) == 0) newLevel = LOG_LEVEL_ERROR;
+      else if (strcmp(levelStr, JSON_KEY_WARNING) == 0) newLevel = LOG_LEVEL_WARNING;
+      else if (strcmp(levelStr, JSON_KEY_INFO) == 0) newLevel = LOG_LEVEL_INFO;
+      else if (strcmp(levelStr, JSON_KEY_DEBUG) == 0) newLevel = LOG_LEVEL_DEBUG;
 
-      if (strcmp(target, "serial") == 0) {
+      if (strcmp(target, JSON_KEY_SERIAL) == 0) {
         AppLogger.setSerialLogLevel(newLevel);
         // AppLogger.setSerialLogLevel already logs this change
-      } else if (strcmp(target, "mqtt") == 0) {
+      } else if (strcmp(target, JSON_KEY_MQTT) == 0) {
         AppLogger.setMqttLogLevel(newLevel);
         // AppLogger.setMqttLogLevel already logs this change
       } else {
@@ -204,8 +221,16 @@ void Core0TaskCode(void * parameter) {
       
       // Take mutex before accessing sensor data
       if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
+        // --- NEW: Performance Logging Start ---
+        unsigned long sensorReadStartTime = millis();
+        bool readSuccess = false;
+        // --- END NEW ---
+
         // Read data from sensors
         if (sensorManager.readSensors()) {
+          // Mark as success
+          readSuccess = true;
+          
           // Cập nhật ngay vào EnvironmentManager
           envManager.setCurrentTemperature(sensorManager.getTemperature());
           envManager.setCurrentHumidity(sensorManager.getHumidity());
@@ -221,30 +246,33 @@ void Core0TaskCode(void * parameter) {
             // Create JSON payload
             String payload = sensorManager.getJsonPayload(API_KEY);
             
-            // Send to MQTT server
-            networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
+            // --- NEW: Performance Logging for MQTT Publish Start ---
+            unsigned long mqttPublishStartTime = millis();
+            bool mqttSuccess = networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
+            unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
+            AppLogger.perf("Core0", "MQTTSensorDataPublish", mqttPublishDuration, mqttSuccess);
+            // --- END NEW ---
+            
+            // Existing log can be kept or removed since we now have the perf log
             AppLogger.debug("Core0", "Sensor data published to MQTT");
           } else {
             AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
-            
-            // Red LED blink when no connection
-            RGB_Light(255, 0, 0);
-            delay(100);
-            RGB_Light(0, 0, 0);
+            // LED status handled globally below
           }
         } else {
           AppLogger.error("Core0", "Failed to read from sensors");
+          // Mark as failure
+          readSuccess = false;
         }
+        
+        // --- NEW: Performance Logging End ---
+        unsigned long sensorReadDuration = millis() - sensorReadStartTime;
+        AppLogger.perf("Core0", "SensorReadOperation", sensorReadDuration, readSuccess);
+        // --- END NEW ---
         
         // Release mutex after accessing sensor data
         xSemaphoreGive(sensorDataMutex);
       }
-    }
-    
-    // Update environment manager (cho các logic khác ngoài việc lấy từ DHT)
-    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
-      lastEnvUpdateTime = currentTime;
-      envManager.update();
     }
     
     // Publish relay and scheduler status khi có thay đổi hoặc cần gửi dự phòng
@@ -293,20 +321,33 @@ void Core0TaskCode(void * parameter) {
     // Blink LED to show activity status
     if (currentTime - lastLedBlinkTime >= ledBlinkInterval) {
       lastLedBlinkTime = currentTime;
-      
+      ledState = !ledState; // Toggle state for blinking effect
+
       if (networkManager.isConnected()) {
         // Blink green LED when connected
-        ledState = !ledState;
         if (ledState) {
-          RGB_Light(0, 20, 0);  // Low brightness to save power
+          RGB_Light(0, 20, 0);  // Low brightness green
         } else {
           RGB_Light(0, 0, 0);
         }
-      } else {
-        // Blink red LED when not connected
-        ledState = !ledState;
+      } else if (networkManager.isAttemptingWifiReconnect() || networkManager.isAttemptingMqttReconnect()) {
+        // Blink blue LED when attempting to reconnect
         if (ledState) {
-          RGB_Light(20, 0, 0);  // Low brightness to save power
+          RGB_Light(0, 0, 20);  // Low brightness blue
+        } else {
+          RGB_Light(0, 0, 0);
+        }
+      } else if (!networkManager.isWifiConnected()){
+        // Blink red LED when WiFi is disconnected and not actively trying to reconnect (e.g. max retries reached for a while)
+        if (ledState) {
+          RGB_Light(20, 0, 0); // Low brightness red
+        } else {
+          RGB_Light(0, 0, 0);
+        }
+      } else { // WiFi connected, but MQTT is not, and not actively trying to reconnect MQTT
+        // Blink yellow LED when MQTT is disconnected (and WiFi is up)
+         if (ledState) {
+          RGB_Light(20, 20, 0); // Low brightness yellow
         } else {
           RGB_Light(0, 0, 0);
         }
@@ -331,6 +372,9 @@ void Core1TaskCode(void * parameter) {
   }
 }
 
+// THÊM VÀO: Khai báo đối tượng Preferences
+Preferences preferences;
+
 void setup() {
   // Initialize Serial as early as possible
   Serial.begin(115200);
@@ -342,17 +386,27 @@ void setup() {
   }
   Serial.println(F("\n\nMain: Serial port initialized.")); // F() to save RAM
 
-  // Initialize NetworkManager (important for MQTT logging)
-  Serial.println(F("Main: Initializing NetworkManager..."));
-  bool networkInitSuccess = networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT);
-  if (networkInitSuccess) {
-    Serial.println(F("Main: NetworkManager initialization successful (WiFi connected, MQTT attempt)."));
+  // THÊM VÀO: Khởi tạo và đọc cấu hình từ NVS (ví dụ)
+  // preferences.begin("app-config", false); // false = read/write, true = read-only
+  // String storedSsid = preferences.getString("wifi_ssid", WIFI_SSID);
+  // String storedPassword = preferences.getString("wifi_pass", WIFI_PASSWORD);
+  // String storedMqttServer = preferences.getString("mqtt_server", MQTT_SERVER);
+  // int storedMqttPort = preferences.getInt("mqtt_port", MQTT_PORT);
+  // String storedApiKey = preferences.getString("api_key", API_KEY);
+  // preferences.end();
+  // Sau đó sử dụng các biến storedSsid, storedPassword,... khi gọi networkManager.begin()
+
+  // Initialize NetworkManager FIRST
+  // Nó sẽ cố gắng kết nối WiFi và MQTT. Nếu thất bại, nó sẽ tự động thử lại trong NetworkManager::loop()
+  if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
+    AppLogger.error("Setup", "NetworkManager failed to initialize properly. Check logs. System will attempt to reconnect.");
+    // LED sẽ được xử lý trong Core0Task dựa trên trạng thái NetworkManager
   } else {
-    Serial.println(F("Main: ERROR - NetworkManager initialization failed (WiFi or MQTT connection problem)."));
+    AppLogger.info("Setup", "NetworkManager initialized. Attempting to connect...");
   }
 
-  // Initialize Logger AFTER NetworkManager has been initialized
-  // Initial log levels: DEBUG for Serial (for development), INFO for MQTT
+  // Initialize Logger AFTER NetworkManager has been initialized (hoặc ít nhất là cố gắng)
+  // AppLogger có thể cần NetworkManager để gửi log MQTT.
   AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
   
   AppLogger.info("Setup", "System setup sequence started.");
@@ -379,55 +433,33 @@ void setup() {
   sensorManager.begin();
   
   // Configure NTP and MQTT subscriptions if network is connected
-  if (networkManager.isConnected()) {
-    AppLogger.info("Setup", "Configuring NTP and MQTT subscriptions...");
-    configTime(7 * 3600, 0, NTP_SERVER); // GMT+7 for Vietnam
-    setenv("TZ", TZ_INFO, 1);
-    tzset();
-    AppLogger.info("Setup", "NTP Server configured: " + String(NTP_SERVER) + " with timezone " + String(TZ_INFO));
+  // VIỆC SUBSCRIBE SẼ DO NETWORKMANAGER TỰ QUẢN LÝ SAU KHI KẾT NỐI
+  // Các lệnh networkManager.subscribe() ở đây sẽ được xóa và chuyển logic vào NetworkManager
 
-    networkManager.setCallback(mqttCallback);
-    if (networkManager.subscribe(MQTT_TOPIC_CONTROL)) {
-      AppLogger.info("Setup", "Subscribed to control topic: " + String(MQTT_TOPIC_CONTROL));
-    } else { 
-      AppLogger.error("Setup", "Failed to subscribe to control topic."); 
-    }
-    
-    if (networkManager.subscribe(MQTT_TOPIC_SCHEDULE)) {
-      AppLogger.info("Setup", "Subscribed to schedule topic: " + String(MQTT_TOPIC_SCHEDULE));
-    } else { 
-      AppLogger.error("Setup", "Failed to subscribe to schedule topic."); 
-    }
-    
-    if (networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL)) {
-      AppLogger.info("Setup", "Subscribed to environment control topic: " + String(MQTT_TOPIC_ENV_CONTROL));
-    } else { 
-      AppLogger.error("Setup", "Failed to subscribe to environment control topic."); 
-    }
-    
-    // Subscribe to log configuration topic
-    if (networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG)) {
-      AppLogger.info("Setup", "Subscribed to log config topic: " + String(MQTT_TOPIC_LOG_CONFIG));
-    } else {
-      AppLogger.error("Setup", "Failed to subscribe to log config topic.");
-    }
-    
-    // Green LED to indicate successful connection
-    RGB_Light(0, 255, 0);
+  // Đăng ký các topic cần thiết thông qua NetworkManager. 
+  // NetworkManager sẽ lưu chúng lại và tự động subscribe/resubscribe khi kết nối MQTT.
+  networkManager.subscribe(MQTT_TOPIC_CONTROL);
+  networkManager.subscribe(MQTT_TOPIC_SCHEDULE);
+  networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL);
+  networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG);
+
+  // Đèn LED và Buzzer báo hiệu trạng thái sẽ được quản lý trong Core0TaskCode dựa trên networkManager.isConnected()
+  // Bỏ các lệnh LED và Buzzer trực tiếp ở đây để tránh xung đột
+  /*
+  if (networkManager.isConnected()) {
+    AppLogger.info("Setup", "Initial network connection successful.");
+    RGB_Light(0, 255, 0); // Green
     delay(1000);
     RGB_Light(0, 0, 0);
-    
-    // Beep to indicate startup completed
     Buzzer_PWM(300);
   } else {
-    AppLogger.warning("Setup", "Network disconnected. Skipping NTP/MQTT subscriptions.");
-    
-    // Red LED to indicate connection failure
-    RGB_Light(255, 0, 0);
+    AppLogger.warning("Setup", "Initial network connection failed. Will retry in background.");
+    RGB_Light(255, 0, 0); // Red
     delay(1000);
     RGB_Light(0, 0, 0);
   }
-  
+  */
+
   // Create tasks and pin to cores
   AppLogger.info("Setup", "Creating and pinning tasks to cores...");
   xTaskCreatePinnedToCore(
@@ -442,4 +474,19 @@ void setup() {
 void loop() {
   // Empty loop - all work is done in tasks
   delay(1000);
+
+  // THÊM VÀO: In ra Stack High Water Mark để theo dõi bộ nhớ
+  // Nên thực hiện sau khi hệ thống đã chạy ổn định một thời gian để có số liệu chính xác.
+  // Có thể đặt trong một điều kiện if để chỉ in định kỳ (ví dụ: mỗi 60 giây)
+  static unsigned long lastStackCheckTime = 0;
+  if (millis() - lastStackCheckTime > 60000) { // Mỗi 60 giây
+    lastStackCheckTime = millis();
+    UBaseType_t core0StackHWM = uxTaskGetStackHighWaterMark(core0Task);
+    UBaseType_t core1StackHWM = uxTaskGetStackHighWaterMark(core1Task);
+    AppLogger.info("StackCheck", "Core0Task HWM: " + String(core0StackHWM) + " words (" + String(core0StackHWM * sizeof(StackType_t)) + " bytes)");
+    AppLogger.info("StackCheck", "Core1Task HWM: " + String(core1StackHWM) + " words (" + String(core1StackHWM * sizeof(StackType_t)) + " bytes)");
+    // Lưu ý: "words" ở đây là StackType_t, thường là 4 byte trên ESP32.
+    // Dựa vào kết quả này, bạn có thể điều chỉnh STACK_SIZE_CORE0 và STACK_SIZE_CORE1.
+    // Ví dụ, nếu HWM là 1000 words (4000 bytes) và STACK_SIZE là 8192 bytes, bạn có thể giảm STACK_SIZE.
+  }
 }

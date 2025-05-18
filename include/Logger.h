@@ -46,6 +46,15 @@ public:
     // Logging function with printf-style formatting
     void logf(LogLevel level, const String& tag, const char* format, ...);
 
+    // --- NEW: Performance Logging Function ---
+    // Logs an event with a specific duration and optional additional metrics.
+    // eventName: A descriptive name for the event being measured (e.g., "SensorRead", "TaskXExecution").
+    // durationMs: The duration of the event in milliseconds.
+    // success: Optional boolean to indicate if the operation was successful.
+    // details: Optional String for any additional relevant details or metrics.
+    void perf(const String& tag, const String& eventName, unsigned long durationMs, bool success = true, const String& details = "");
+    // --- END NEW ---
+
     // Configure log levels dynamically
     void setSerialLogLevel(LogLevel level);
     void setMqttLogLevel(LogLevel level);
@@ -56,6 +65,7 @@ private:
     NetworkManager* _networkManager; // Pointer to use NetworkManager for MQTT publishing
     LogLevel _serialLogLevel;        // Current log level for Serial
     LogLevel _mqttLogLevel;          // Current log level for MQTT
+    const char* _apiKey;             // API key for authentication
 
     const char* _mqttLogTopic = "irrigation/esp32_6relay/logs"; // MQTT topic for logs
 
