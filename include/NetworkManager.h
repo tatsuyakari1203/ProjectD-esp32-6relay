@@ -19,6 +19,14 @@
 // #include <freertos/task.h>
 // #include <freertos/semphr.h>
 
+// THÊM VÀO: Enum for WiFi connection states
+enum WifiConnectionState {
+    WIFI_STATE_DISCONNECTED,
+    WIFI_STATE_CONNECTING,
+    WIFI_STATE_CONNECTED,
+    WIFI_STATE_START_PORTAL_PENDING // Added for managing portal start
+};
+
 typedef void (*MqttCallback)(char* topic, byte* payload, unsigned int length);
 
 // Configuration for retry mechanisms
@@ -28,6 +36,10 @@ const unsigned long INITIAL_RETRY_INTERVAL_MS = 5000;     // 5 seconds
 const unsigned long MAX_RETRY_INTERVAL_MS = 60000;        // 1 minute
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;      // 15 seconds for WiFi.begin()
 const int NTP_ATTEMPTS_PER_SERVER = 2; // Max attempts for each NTP server before trying next
+
+// Add NTP sync interval constants
+const unsigned long NTP_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const unsigned long NTP_FORCE_SYNC_RETRY_INTERVAL_MS = 60 * 1000; // 1 minute if initial/forced sync fails
 
 // THÊM VÀO: Hằng số cho AP Mode và WebServer
 // const char* AP_SSID = "ESP32-Config"; // Sẽ định nghĩa trong .cpp
@@ -59,6 +71,7 @@ public:
     bool isAttemptingWifiReconnect() const;
     bool isAttemptingMqttReconnect() const;
     int getMqttState();
+    WifiConnectionState getWifiConnectionState() const; // Getter for the new state
     
     // THÊM VÀO: Phương thức cho Config Portal
     void startConfigPortal();
@@ -101,6 +114,14 @@ private:
     bool _isAttemptingWifiReconnect;
     bool _isAttemptingMqttReconnect;
 
+    // THÊM VÀO: WiFi connection state management variables
+    WifiConnectionState _wifiConnectionState;
+    unsigned long _wifiConnectStartTime; 
+
+    // NTP timing variables
+    unsigned long _lastNtpSyncAttempt;
+    unsigned long _lastSuccessfulNtpSync;
+
     std::vector<String> _subscriptionTopics; // Store topics to subscribe/resubscribe
 
     // THÊM VÀO: AsyncWebServer object
@@ -111,7 +132,7 @@ private:
     Preferences _preferences;
 
     // Private helper methods
-    bool _connectWifi(const char* ssid, const char* password); // Sửa đổi để nhận ssid/pass
+    void _initiateWifiConnection(const char* ssid, const char* password); // New non-blocking initiator
     bool _connectMqtt(); // Renamed from reconnect for clarity
     void _executeMqttSubscriptions();
     void _handleWifiDisconnect();
