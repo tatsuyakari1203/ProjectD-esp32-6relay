@@ -5,6 +5,7 @@
 #include "../include/RelayManager.h"
 #include "../include/TaskScheduler.h"
 #include "../include/EnvironmentManager.h"
+#include "../include/Logger.h"
 #include <time.h>
 
 // Function prototypes
@@ -54,6 +55,9 @@ const char* MQTT_TOPIC_SCHEDULE = "irrigation/esp32_6relay/schedule";
 const char* MQTT_TOPIC_SCHEDULE_STATUS = "irrigation/esp32_6relay/schedule/status";
 const char* MQTT_TOPIC_ENV_CONTROL = "irrigation/esp32_6relay/environment";
 
+// Add a new MQTT topic for log configuration
+const char* MQTT_TOPIC_LOG_CONFIG = "irrigation/esp32_6relay/logconfig";
+
 // NTP configuration
 const char* NTP_SERVER = "pool.ntp.org";
 const char* TZ_INFO = "Asia/Ho_Chi_Minh";  // Vietnam timezone
@@ -85,21 +89,15 @@ SemaphoreHandle_t sensorDataMutex;
 void printLocalTime() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)){
-    Serial.println("ERROR: Could not get time from NTP");
+    AppLogger.error("Time", "Could not get time from NTP");
     return;
   }
   
   char timeString[50];
   strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  Serial.print("Current time: ");
-  Serial.println(timeString);
-  
-  // Print timezone information
-  Serial.print("Timezone: ");
-  Serial.print(TZ_INFO);
-  Serial.print(" (Day of week: ");
-  Serial.print(timeinfo.tm_wday);  // 0 is Sunday
-  Serial.println(")");
+  AppLogger.info("Time", "Current time: " + String(timeString) + 
+                ", Timezone: " + String(TZ_INFO) + 
+                " (Day of week: " + String(timeinfo.tm_wday) + ")");
 }
 
 // MQTT callback function
@@ -109,9 +107,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(message, payload, length);
   message[length] = '\0';
   
-  Serial.println("Received MQTT message:");
-  Serial.println("- Topic: " + String(topic));
-  Serial.println("- Payload: " + String(message));
+  AppLogger.debug("MQTTCallbk", "Received MQTT message on topic: " + String(topic));
+  AppLogger.debug("MQTTCallbk", "Payload: " + String(message));
   
   // Process message based on topic
   if (strcmp(topic, MQTT_TOPIC_CONTROL) == 0) {
@@ -128,7 +125,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     DeserializationError error = deserializeJson(doc, message);
     
     if (error) {
-      Serial.println("JSON parsing failed: " + String(error.c_str()));
+      AppLogger.error("MQTTCallbk", "JSON parsing failed: " + String(error.c_str()));
       return;
     }
     
@@ -138,23 +135,62 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       int zone = soil["zone"];
       float value = soil["value"];
       envManager.setSoilMoisture(zone, value);
+      AppLogger.info("MQTTCallbk", "Manual soil moisture update: Zone " + String(zone) + ", Value: " + String(value));
     }
     
     if (doc.containsKey("rain")) {
       bool isRaining = doc["rain"];
       envManager.setRainStatus(isRaining);
+      AppLogger.info("MQTTCallbk", "Manual rain status update: " + String(isRaining ? "Raining" : "Not raining"));
     }
     
     if (doc.containsKey("light")) {
       int lightLevel = doc["light"];
       envManager.setLightLevel(lightLevel);
+      AppLogger.info("MQTTCallbk", "Manual light level update: " + String(lightLevel));
+    }
+  }
+  else if (strcmp(topic, MQTT_TOPIC_LOG_CONFIG) == 0) {
+    // Process log configuration command
+    AppLogger.info("MQTTCallbk", "Received log configuration command. Payload: " + String(message));
+
+    DynamicJsonDocument doc(256); // Small payload for config
+    DeserializationError error = deserializeJson(doc, message);
+
+    if (error) {
+      AppLogger.error("MQTTCallbk", "Log config JSON parsing failed: " + String(error.c_str()));
+      return;
+    }
+
+    const char* target = doc["target"]; // "serial" or "mqtt"
+    const char* levelStr = doc["level"];  // "NONE", "CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"
+
+    if (target && levelStr) {
+      LogLevel newLevel = LOG_LEVEL_NONE; // Default
+      if (strcmp(levelStr, "CRITICAL") == 0) newLevel = LOG_LEVEL_CRITICAL;
+      else if (strcmp(levelStr, "ERROR") == 0) newLevel = LOG_LEVEL_ERROR;
+      else if (strcmp(levelStr, "WARNING") == 0) newLevel = LOG_LEVEL_WARNING;
+      else if (strcmp(levelStr, "INFO") == 0) newLevel = LOG_LEVEL_INFO;
+      else if (strcmp(levelStr, "DEBUG") == 0) newLevel = LOG_LEVEL_DEBUG;
+
+      if (strcmp(target, "serial") == 0) {
+        AppLogger.setSerialLogLevel(newLevel);
+        // AppLogger.setSerialLogLevel already logs this change
+      } else if (strcmp(target, "mqtt") == 0) {
+        AppLogger.setMqttLogLevel(newLevel);
+        // AppLogger.setMqttLogLevel already logs this change
+      } else {
+        AppLogger.warning("MQTTCallbk", "Invalid log config target: " + String(target));
+      }
+    } else {
+      AppLogger.warning("MQTTCallbk", "Log config command missing 'target' or 'level' field.");
     }
   }
 }
 
 // Core 0 Task - Handles sensors, network, MQTT (preemptive)
 void Core0TaskCode(void * parameter) {
-  Serial.println("Core 0 Task started on core " + String(xPortGetCoreID()));
+  AppLogger.info("Core0", "Task started on core " + String(xPortGetCoreID()));
   
   for(;;) {
     // Maintain network connection
@@ -175,17 +211,10 @@ void Core0TaskCode(void * parameter) {
           envManager.setCurrentHumidity(sensorManager.getHumidity());
           envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
           
-          // Print data to Serial for debugging
-          Serial.print("Temperature: ");
-          Serial.print(sensorManager.getTemperature());
-          Serial.print("°C, Humidity: ");
-          Serial.print(sensorManager.getHumidity());
-          Serial.print("%, Heat Index: ");
-          Serial.print(sensorManager.getHeatIndex());
-          Serial.println("°C");
-          
-          // Display current time along with sensor data
-          printLocalTime();
+          // Log sensor data
+          AppLogger.debug("Core0", "Sensors read: T=" + String(sensorManager.getTemperature()) +
+                          "°C, H=" + String(sensorManager.getHumidity()) +
+                          "%, HI=" + String(sensorManager.getHeatIndex()) + "°C");
           
           // Send data to MQTT server immediately after reading
           if (networkManager.isConnected()) {
@@ -194,8 +223,9 @@ void Core0TaskCode(void * parameter) {
             
             // Send to MQTT server
             networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
+            AppLogger.debug("Core0", "Sensor data published to MQTT");
           } else {
-            Serial.println("ERROR: No network connection, cannot send data");
+            AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
             
             // Red LED blink when no connection
             RGB_Light(255, 0, 0);
@@ -203,7 +233,7 @@ void Core0TaskCode(void * parameter) {
             RGB_Light(0, 0, 0);
           }
         } else {
-          Serial.println("ERROR: Failed to read from sensors");
+          AppLogger.error("Core0", "Failed to read from sensors");
         }
         
         // Release mutex after accessing sensor data
@@ -225,12 +255,22 @@ void Core0TaskCode(void * parameter) {
       if (relayManager.hasStatusChangedAndReset() || forcedReport) {
         String statusPayload = relayManager.getStatusJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
+        if (forcedReport) {
+          AppLogger.debug("Core0", "Relay status published to MQTT (forced report)");
+        } else {
+          AppLogger.debug("Core0", "Relay status published to MQTT");
+        }
       }
       
       // Publish schedule status khi có thay đổi hoặc gửi dự phòng
       if (taskScheduler.hasScheduleStatusChangedAndReset() || forcedReport) {
         String schedulePayload = taskScheduler.getTasksJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
+        if (forcedReport) {
+          AppLogger.debug("Core0", "Schedule status published to MQTT (forced report)");
+        } else {
+          AppLogger.debug("Core0", "Schedule status published to MQTT");
+        }
       }
       
       // Cập nhật thời gian gửi dự phòng nếu đã gửi dự phòng
@@ -280,7 +320,7 @@ void Core0TaskCode(void * parameter) {
 
 // Core 1 Task - Handles irrigation control (non-preemptive)
 void Core1TaskCode(void * parameter) {
-  Serial.println("Core 1 Task started on core " + String(xPortGetCoreID()));
+  AppLogger.info("Core1", "Task started on core " + String(xPortGetCoreID()));
   
   for(;;) {
     // Update relay manager to handle timer-based relay control
@@ -292,69 +332,84 @@ void Core1TaskCode(void * parameter) {
 }
 
 void setup() {
-  // Initialize Serial
+  // Initialize Serial as early as possible
   Serial.begin(115200);
   
-  // Wait for Serial connection or maximum 5 seconds
-  uint32_t startTime = millis();
-  while (!Serial && millis() - startTime < 5000) {
-    delay(100);
+  // Wait a bit for Serial to ensure initialization logs can be seen
+  uint32_t serialStartTime = millis();
+  while (!Serial && (millis() - serialStartTime < 2000)) { // Wait a maximum of 2 seconds
+    delay(10);
   }
+  Serial.println(F("\n\nMain: Serial port initialized.")); // F() to save RAM
+
+  // Initialize NetworkManager (important for MQTT logging)
+  Serial.println(F("Main: Initializing NetworkManager..."));
+  bool networkInitSuccess = networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT);
+  if (networkInitSuccess) {
+    Serial.println(F("Main: NetworkManager initialization successful (WiFi connected, MQTT attempt)."));
+  } else {
+    Serial.println(F("Main: ERROR - NetworkManager initialization failed (WiFi or MQTT connection problem)."));
+  }
+
+  // Initialize Logger AFTER NetworkManager has been initialized
+  // Initial log levels: DEBUG for Serial (for development), INFO for MQTT
+  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
   
-  // Startup message
-  Serial.println("");
-  Serial.println("=============================================");
-  Serial.println("ESP32-S3 Dual-Core Irrigation System");
-  Serial.println("=============================================");
-  
+  AppLogger.info("Setup", "System setup sequence started.");
+  AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");
+
   // Create semaphore
   sensorDataMutex = xSemaphoreCreateMutex();
   
   // Initialize GPIO
+  AppLogger.debug("Setup", "Initializing GPIO...");
   GPIO_Init();
-  Serial.println("GPIO initialized");
+  AppLogger.info("Setup", "GPIO initialized");
   
   // Initialize relay manager
+  AppLogger.debug("Setup", "Initializing RelayManager...");
   relayManager.begin(relayPins, numRelays);
   
   // Initialize task scheduler
+  AppLogger.debug("Setup", "Initializing TaskScheduler...");
   taskScheduler.begin();
   
   // Initialize sensors
+  AppLogger.debug("Setup", "Initializing SensorManager...");
   sensorManager.begin();
   
-  // Initialize network connection
-  if (networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
-    Serial.println("Network connection successful");
-    
-    // Configure NTP time for Vietnam timezone (GMT+7)
-    configTime(7 * 3600, 0, NTP_SERVER); // 7 hours offset for Vietnam
-    setenv("TZ", "Asia/Ho_Chi_Minh", 1); // Set Vietnam timezone
+  // Configure NTP and MQTT subscriptions if network is connected
+  if (networkManager.isConnected()) {
+    AppLogger.info("Setup", "Configuring NTP and MQTT subscriptions...");
+    configTime(7 * 3600, 0, NTP_SERVER); // GMT+7 for Vietnam
+    setenv("TZ", TZ_INFO, 1);
     tzset();
-    Serial.println("NTP Server configured: " + String(NTP_SERVER) + " with Vietnam timezone");
-    
-    // Set MQTT callback and subscribe to control topics
+    AppLogger.info("Setup", "NTP Server configured: " + String(NTP_SERVER) + " with timezone " + String(TZ_INFO));
+
     networkManager.setCallback(mqttCallback);
-    
-    // Subscribe to relay control topic
     if (networkManager.subscribe(MQTT_TOPIC_CONTROL)) {
-      Serial.println("Subscribed to control topic: " + String(MQTT_TOPIC_CONTROL));
-    } else {
-      Serial.println("Failed to subscribe to control topic");
+      AppLogger.info("Setup", "Subscribed to control topic: " + String(MQTT_TOPIC_CONTROL));
+    } else { 
+      AppLogger.error("Setup", "Failed to subscribe to control topic."); 
     }
     
-    // Subscribe to schedule topic
     if (networkManager.subscribe(MQTT_TOPIC_SCHEDULE)) {
-      Serial.println("Subscribed to schedule topic: " + String(MQTT_TOPIC_SCHEDULE));
-    } else {
-      Serial.println("Failed to subscribe to schedule topic");
+      AppLogger.info("Setup", "Subscribed to schedule topic: " + String(MQTT_TOPIC_SCHEDULE));
+    } else { 
+      AppLogger.error("Setup", "Failed to subscribe to schedule topic."); 
     }
     
-    // Subscribe to environment control topic
     if (networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL)) {
-      Serial.println("Subscribed to environment control topic: " + String(MQTT_TOPIC_ENV_CONTROL));
+      AppLogger.info("Setup", "Subscribed to environment control topic: " + String(MQTT_TOPIC_ENV_CONTROL));
+    } else { 
+      AppLogger.error("Setup", "Failed to subscribe to environment control topic."); 
+    }
+    
+    // Subscribe to log configuration topic
+    if (networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG)) {
+      AppLogger.info("Setup", "Subscribed to log config topic: " + String(MQTT_TOPIC_LOG_CONFIG));
     } else {
-      Serial.println("Failed to subscribe to environment control topic");
+      AppLogger.error("Setup", "Failed to subscribe to log config topic.");
     }
     
     // Green LED to indicate successful connection
@@ -365,7 +420,7 @@ void setup() {
     // Beep to indicate startup completed
     Buzzer_PWM(300);
   } else {
-    Serial.println("ERROR: Network connection failed");
+    AppLogger.warning("Setup", "Network disconnected. Skipping NTP/MQTT subscriptions.");
     
     // Red LED to indicate connection failure
     RGB_Light(255, 0, 0);
@@ -373,31 +428,15 @@ void setup() {
     RGB_Light(0, 0, 0);
   }
   
-  // Create tasks that will run on specific cores
+  // Create tasks and pin to cores
+  AppLogger.info("Setup", "Creating and pinning tasks to cores...");
   xTaskCreatePinnedToCore(
-    Core0TaskCode,    // Task function
-    "Core0Task",      // Name of task
-    STACK_SIZE_CORE0, // Stack size
-    NULL,             // Task input parameter
-    PRIORITY_MEDIUM,  // Priority (higher number = higher priority)
-    &core0Task,       // Task handle
-    0);               // Core where the task should run (Core 0)
-    
+    Core0TaskCode, "Core0Task", STACK_SIZE_CORE0, NULL, PRIORITY_MEDIUM, &core0Task, 0);
   xTaskCreatePinnedToCore(
-    Core1TaskCode,    // Task function
-    "Core1Task",      // Name of task
-    STACK_SIZE_CORE1, // Stack size
-    NULL,             // Task input parameter
-    PRIORITY_MEDIUM,  // Priority
-    &core1Task,       // Task handle
-    1);               // Core where the task should run (Core 1)
+    Core1TaskCode, "Core1Task", STACK_SIZE_CORE1, NULL, PRIORITY_MEDIUM, &core1Task, 1);
     
-  // Print debug info
-  delay(500);
-  Serial.println("Tasks created and running");
-  Serial.println("Core 0: Handling sensors, MQTT, scheduling (preemptive)");
-  Serial.println("Core 1: Handling relay control (non-preemptive)");
-  Serial.println("System ready");
+  AppLogger.info("Setup", "System setup sequence completed. Tasks are running.");
+  AppLogger.info("Setup", "---------------- SYSTEM READY ----------------");
 }
 
 void loop() {

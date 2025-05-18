@@ -1,4 +1,5 @@
 #include "../include/NetworkManager.h"
+#include "../include/Logger.h"
 
 NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) { // 7 hours offset for Vietnam
     _wifiConnected = false;
@@ -11,6 +12,7 @@ NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600
     uint32_t timestamp = millis();
     snprintf(_clientId, sizeof(_clientId), "ESP32Client-%06X-%u", random_id, timestamp % 1000000);
     
+    // This will use Serial directly since AppLogger is not yet initialized
     Serial.println("Generated MQTT Client ID: " + String(_clientId));
 }
 
@@ -100,7 +102,7 @@ bool NetworkManager::reconnect() {
     }
     
     // Try to connect to MQTT
-    Serial.print("Attempting MQTT connection...");
+    AppLogger.debug("NetMgr", "Attempting MQTT connection...");
     
     bool connected = false;
     
@@ -113,12 +115,11 @@ bool NetworkManager::reconnect() {
     }
     
     if (connected) {
-        Serial.println("connected");
+        AppLogger.info("NetMgr", "MQTT connected to " + String(_mqttServer) + ":" + String(_mqttPort));
         _mqttConnected = true;
         return true;
     } else {
-        Serial.print("failed, rc=");
-        Serial.print(_mqttClient.state());
+        AppLogger.error("NetMgr", "MQTT connection failed, rc=" + String(_mqttClient.state()));
         _mqttConnected = false;
         return false;
     }
@@ -126,16 +127,13 @@ bool NetworkManager::reconnect() {
 
 bool NetworkManager::publish(const char* topic, const char* payload) {
     if (!_mqttConnected && !reconnect()) {
-        Serial.println("ERROR: MQTT not connected and reconnect failed");
+        AppLogger.error("NetMgr", "MQTT not connected and reconnect failed");
         return false;
     }
 
     // Log the publish attempt with details
-    Serial.println("Publishing to MQTT:");
-    Serial.println("- Server: " + String(_mqttServer) + ":" + String(_mqttPort));
-    Serial.println("- Client ID: " + String(_clientId));
-    Serial.println("- Topic: " + String(topic));
-    Serial.println("- Payload length: " + String(strlen(payload)));
+    AppLogger.debug("NetMgr", "Publishing to MQTT topic: " + String(topic) + 
+                   ", length: " + String(strlen(payload)));
     
     // Set the maximum packet size for MQTT (default is often too small)
     _mqttClient.setBufferSize(1024);
@@ -146,14 +144,14 @@ bool NetworkManager::publish(const char* topic, const char* payload) {
     const int maxRetries = 3;
     
     while (!success && retries < maxRetries) {
-        Serial.print("Publish attempt " + String(retries+1) + "/" + String(maxRetries) + "... ");
+        AppLogger.debug("NetMgr", "Publish attempt " + String(retries+1) + "/" + String(maxRetries));
         
         success = _mqttClient.publish(topic, payload);
         
         if (success) {
-            Serial.println("success!");
+            AppLogger.debug("NetMgr", "Publish successful");
         } else {
-            Serial.println("failed. MQTT state: " + String(_mqttClient.state()));
+            AppLogger.warning("NetMgr", "Publish failed. MQTT state: " + String(_mqttClient.state()));
             retries++;
             delay(500); // Wait before retry
         }
@@ -164,20 +162,20 @@ bool NetworkManager::publish(const char* topic, const char* payload) {
 
 bool NetworkManager::subscribe(const char* topic) {
     if (!_mqttConnected && !reconnect()) {
-        Serial.println("ERROR: MQTT not connected and reconnect failed");
+        AppLogger.error("NetMgr", "MQTT not connected and reconnect failed");
         return false;
     }
     
     // Log the subscribe attempt
-    Serial.println("Subscribing to MQTT topic: " + String(topic));
+    AppLogger.debug("NetMgr", "Subscribing to MQTT topic: " + String(topic));
     
     // Subscribe to the topic
     bool success = _mqttClient.subscribe(topic);
     
     if (success) {
-        Serial.println("Successfully subscribed to topic: " + String(topic));
+        AppLogger.info("NetMgr", "Successfully subscribed to topic: " + String(topic));
     } else {
-        Serial.println("Failed to subscribe to topic. MQTT state: " + String(_mqttClient.state()));
+        AppLogger.error("NetMgr", "Failed to subscribe to topic. MQTT state: " + String(_mqttClient.state()));
     }
     
     return success;
@@ -185,7 +183,7 @@ bool NetworkManager::subscribe(const char* topic) {
 
 void NetworkManager::setCallback(MqttCallback callback) {
     _mqttClient.setCallback(callback);
-    Serial.println("MQTT callback set");
+    AppLogger.info("NetMgr", "MQTT callback set");
 }
 
 bool NetworkManager::isConnected() {

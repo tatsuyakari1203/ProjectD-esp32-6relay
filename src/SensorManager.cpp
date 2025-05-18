@@ -1,4 +1,5 @@
 #include "../include/SensorManager.h"
+#include "../include/Logger.h"
 
 SensorManager::SensorManager() : _dht(DHT_PIN, DHT_TYPE) {
     _temperature = 0.0;
@@ -10,7 +11,7 @@ SensorManager::SensorManager() : _dht(DHT_PIN, DHT_TYPE) {
 
 void SensorManager::begin() {
     _dht.begin();
-    Serial.println("DHT21 sensor initialized");
+    AppLogger.info("SensorMgr", "DHT21 sensor initialized");
 }
 
 bool SensorManager::readSensors() {
@@ -28,7 +29,7 @@ bool SensorManager::readSensors() {
         
         // Check if any reading failed
         if (isnan(_humidity) || isnan(_temperature)) {
-            Serial.println("Failed to read from DHT sensor!");
+            AppLogger.error("SensorMgr", "Failed to read from DHT sensor!");
             _readSuccess = false;
             return false;
         }

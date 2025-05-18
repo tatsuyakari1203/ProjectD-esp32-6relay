@@ -1,4 +1,5 @@
 #include "../include/RelayManager.h"
+#include "../include/Logger.h"
 #include <time.h>
 
 RelayManager::RelayManager() {
@@ -28,13 +29,13 @@ void RelayManager::begin(const int* relayPins, int numRelays) {
     // Đánh dấu có thay đổi để gửi trạng thái ban đầu
     _statusChanged = true;
     
-    Serial.println("RelayManager initialized with " + String(_numRelays) + " relays");
+    AppLogger.info("RelayMgr", "Initialized with " + String(_numRelays) + " relays");
 }
 
 void RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) {
     // Kiểm tra chỉ số relay hợp lệ
     if (relayIndex < 0 || relayIndex >= _numRelays) {
-        Serial.println("ERROR: Invalid relay index: " + String(relayIndex));
+        AppLogger.error("RelayMgr", "ERROR: Invalid relay index: " + String(relayIndex));
         return;
     }
     
@@ -51,17 +52,17 @@ void RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) 
             // Nếu có thời gian, thiết lập thời điểm kết thúc
             if (duration > 0) {
                 _relayStatus[relayIndex].endTime = millis() + duration;
-                Serial.println("Relay " + String(relayIndex + 1) + " turned ON for " + String(duration / 1000) + " seconds");
+                AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " turned ON for " + String(duration / 1000) + " seconds");
             } else {
                 _relayStatus[relayIndex].endTime = 0;
-                Serial.println("Relay " + String(relayIndex + 1) + " turned ON indefinitely");
+                AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " turned ON indefinitely");
             }
         } else {
             // Tắt relay
             digitalWrite(_relayPins[relayIndex], LOW);
             _relayStatus[relayIndex].state = false;
             _relayStatus[relayIndex].endTime = 0;
-            Serial.println("Relay " + String(relayIndex + 1) + " turned OFF");
+            AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " turned OFF");
         }
         
         // Đánh dấu có sự thay đổi nếu trạng thái hoặc thời gian thay đổi
@@ -134,7 +135,7 @@ void RelayManager::update() {
                     _relayStatus[i].endTime = 0;
                     anyRelayChanged = true;
                     
-                    Serial.println("Auto turned OFF relay " + String(i + 1) + " (timer expired)");
+                    AppLogger.info("RelayMgr", "Auto turned OFF relay " + String(i + 1) + " (timer expired)");
                 }
             }
         }
@@ -193,13 +194,13 @@ bool RelayManager::processCommand(const char* json) {
     DeserializationError error = deserializeJson(doc, json);
     
     if (error) {
-        Serial.println("JSON parsing failed: " + String(error.c_str()));
+        AppLogger.error("RelayMgr", "JSON parsing failed: " + String(error.c_str()));
         return false;
     }
     
     // Kiểm tra nếu có trường relays
     if (!doc.containsKey("relays")) {
-        Serial.println("Command missing 'relays' field");
+        AppLogger.error("RelayMgr", "Command missing 'relays' field");
         return false;
     }
     
@@ -239,7 +240,7 @@ bool RelayManager::processCommand(const char* json) {
                     anyChanges = true;
                 }
             } else {
-                Serial.println("Invalid relay ID: " + String(id));
+                AppLogger.error("RelayMgr", "Invalid relay ID: " + String(id));
             }
         }
     }
