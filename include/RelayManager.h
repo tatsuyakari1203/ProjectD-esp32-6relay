@@ -41,11 +41,15 @@ public:
     // Xử lý JSON lệnh điều khiển
     bool processCommand(const char* json);
     
+    // Kiểm tra xem trạng thái có thay đổi không và reset cờ
+    bool hasStatusChangedAndReset();
+    
 private:
     const int* _relayPins;        // Con trỏ đến mảng chân GPIO relay
     int _numRelays;               // Số lượng relay
     RelayStatus* _relayStatus;    // Mảng trạng thái relay
     SemaphoreHandle_t _mutex;     // Mutex để bảo vệ truy cập
+    bool _statusChanged;          // Cờ đánh dấu thay đổi trạng thái
 };
 
 #endif // RELAY_MANAGER_H 

@@ -4,13 +4,16 @@ TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& env
     : _relayManager(relayManager), _envManager(envManager) {
     _mutex = xSemaphoreCreateMutex();
     _lastCheckTime = 0;
+    _scheduleStatusChanged = false;
 }
 
 void TaskScheduler::begin() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
         // Khởi tạo danh sách lịch rỗng
         _tasks.clear();
-        _activeZones.clear();
+        _activeZonesBits.reset(); // Xóa tất cả các bit (tất cả zone không hoạt động)
+        _earliestNextCheckTime = 0;
+        _scheduleStatusChanged = true; // Đánh dấu có thay đổi để gửi trạng thái ban đầu
         
         Serial.println("TaskScheduler initialized");
         
@@ -44,6 +47,12 @@ bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task) {
             Serial.println("Added new irrigation task ID: " + String(task.id));
         }
         
+        // Đánh dấu có thay đổi trạng thái lịch
+        _scheduleStatusChanged = true;
+        
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra
+        recomputeEarliestNextCheckTime();
+        
         xSemaphoreGive(_mutex);
         return true;
     }
@@ -64,6 +73,12 @@ bool TaskScheduler::deleteTask(int taskId) {
             
             // Xóa lịch
             _tasks.erase(it);
+            
+            // Đánh dấu có thay đổi trạng thái lịch
+            _scheduleStatusChanged = true;
+            
+            // Tính toán lại thời điểm sớm nhất cần kiểm tra
+            recomputeEarliestNextCheckTime();
             
             Serial.println("Deleted irrigation task ID: " + String(taskId));
             xSemaphoreGive(_mutex);
@@ -307,6 +322,15 @@ bool TaskScheduler::processCommand(const char* json) {
         }
     }
     
+    // Nếu có bất kỳ thay đổi nào
+    if (anyChanges) {
+        // Đánh dấu có thay đổi trạng thái lịch
+        _scheduleStatusChanged = true;
+        
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra
+        recomputeEarliestNextCheckTime();
+    }
+    
     return anyChanges;
 }
 
@@ -407,8 +431,18 @@ void TaskScheduler::update() {
         // Kiểm tra thời gian hiện tại
         time_t now;
         time(&now);
+        
+        // Kiểm tra nếu chưa đến thời điểm sớm nhất cần kiểm tra
+        if (_earliestNextCheckTime != 0 && now < _earliestNextCheckTime) {
+            // Chưa đến thời điểm cần kiểm tra, thoát sớm
+            xSemaphoreGive(_mutex);
+            return;
+        }
+        
         struct tm timeinfo;
         localtime_r(&now, &timeinfo);
+        
+        bool anyStateChanged = false;
         
         // 1. Cập nhật trạng thái lịch đang chạy
         for (auto& task : _tasks) {
@@ -416,7 +450,13 @@ void TaskScheduler::update() {
                 // Kiểm tra nếu đã hoàn thành
                 if (now - task.start_time >= task.duration * 60) {
                     stopTask(task);
+                    
+                    // Đánh dấu thay đổi trạng thái
+                    TaskState oldState = task.state;
                     task.state = COMPLETED;
+                    if (oldState != task.state) {
+                        anyStateChanged = true;
+                    }
                     
                     // Tính thời gian chạy kế tiếp
                     task.next_run = calculateNextRunTime(task);
@@ -467,7 +507,14 @@ void TaskScheduler::update() {
                                                 runningTask.zones.end(), 
                                                 zoneId) != runningTask.zones.end()) {
                                         stopTask(runningTask);
+                                        
+                                        // Đánh dấu thay đổi trạng thái
+                                        TaskState oldState = runningTask.state;
                                         runningTask.state = COMPLETED;
+                                        if (oldState != runningTask.state) {
+                                            anyStateChanged = true;
+                                        }
+                                        
                                         runningTask.next_run = calculateNextRunTime(runningTask);
                                         
                                         Serial.println("Preempted task " + String(runningTask.id) + 
@@ -488,10 +535,24 @@ void TaskScheduler::update() {
                 // Nếu có thể chạy
                 if (canStart) {
                     startTask(task);
+                    
+                    // Đánh dấu thay đổi trạng thái
+                    TaskState oldState = task.state;
                     task.state = RUNNING;
+                    if (oldState != task.state) {
+                        anyStateChanged = true;
+                    }
                 }
             }
         }
+        
+        // Đánh dấu có thay đổi lịch nếu có task nào thay đổi trạng thái
+        if (anyStateChanged) {
+            _scheduleStatusChanged = true;
+        }
+        
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra sau khi cập nhật
+        recomputeEarliestNextCheckTime();
         
         xSemaphoreGive(_mutex);
     }
@@ -566,8 +627,8 @@ void TaskScheduler::startTask(IrrigationTask& task) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOn(relayIndex, task.duration * 60 * 1000);
             
-            // Thêm vào danh sách vùng đang hoạt động
-            _activeZones.push_back(zoneId);
+            // Đánh dấu bit tương ứng với zone đang hoạt động (dùng 0-based index)
+            _activeZonesBits.set(zoneId - 1);
         }
     }
     
@@ -591,11 +652,8 @@ void TaskScheduler::stopTask(IrrigationTask& task) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOff(relayIndex);
             
-            // Xóa khỏi danh sách vùng đang hoạt động
-            _activeZones.erase(std::remove(_activeZones.begin(), 
-                                         _activeZones.end(), 
-                                         zoneId), 
-                             _activeZones.end());
+            // Reset bit tương ứng với zone đang hoạt động (dùng 0-based index)
+            _activeZonesBits.reset(zoneId - 1);
         }
     }
     
@@ -603,7 +661,12 @@ void TaskScheduler::stopTask(IrrigationTask& task) {
 }
 
 bool TaskScheduler::isZoneBusy(uint8_t zoneId) {
-    return std::find(_activeZones.begin(), _activeZones.end(), zoneId) != _activeZones.end();
+    if (zoneId >= 1 && zoneId <= 6) {
+        // Kiểm tra bit tương ứng với zone (dùng 0-based index)
+        return _activeZonesBits.test(zoneId - 1);
+    }
+    Serial.println("ERROR: Invalid zoneId in isZoneBusy: " + String(zoneId));
+    return false; // Zone ID không hợp lệ
 }
 
 bool TaskScheduler::isHigherPriority(int taskId) {
@@ -691,4 +754,44 @@ JsonArray TaskScheduler::bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap
     }
     
     return array;
+}
+
+// Lấy thời điểm sớm nhất cần kiểm tra lịch
+time_t TaskScheduler::getEarliestNextCheckTime() const {
+    // Không cần mutex cho đọc đơn giản từ Core0
+    return _earliestNextCheckTime;
+}
+
+// Tính toán lại thời điểm sớm nhất cần kiểm tra lịch
+void TaskScheduler::recomputeEarliestNextCheckTime() {
+    _earliestNextCheckTime = 0; // Reset
+    time_t now_val;
+    time(&now_val);
+
+    for (const auto& task : _tasks) {
+        if (task.active && task.next_run > now_val) {
+            if (_earliestNextCheckTime == 0 || task.next_run < _earliestNextCheckTime) {
+                _earliestNextCheckTime = task.next_run;
+            }
+        }
+    }
+    
+    if (_earliestNextCheckTime == 0 && !_tasks.empty()) {
+        // Nếu có task nhưng tất cả đã qua hoặc không active
+        _earliestNextCheckTime = now_val + 60; // Kiểm tra lại sau 1 phút như một fallback
+    } else if (_tasks.empty()) {
+        // Nếu không có task nào, kiểm tra lại sau 5 phút
+        _earliestNextCheckTime = now_val + 300;
+    }
+}
+
+bool TaskScheduler::hasScheduleStatusChangedAndReset() {
+    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+        bool changed = _scheduleStatusChanged;
+        _scheduleStatusChanged = false; // Reset cờ
+        xSemaphoreGive(_mutex);
+        return changed;
+    }
+    // Fallback nếu không lấy được mutex
+    return true;
 } 

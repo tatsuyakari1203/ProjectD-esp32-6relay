@@ -6,6 +6,7 @@ RelayManager::RelayManager() {
     _numRelays = 0;
     _relayStatus = nullptr;
     _mutex = xSemaphoreCreateMutex();
+    _statusChanged = false;
 }
 
 void RelayManager::begin(const int* relayPins, int numRelays) {
@@ -24,6 +25,9 @@ void RelayManager::begin(const int* relayPins, int numRelays) {
         _relayStatus[i].endTime = 0;
     }
     
+    // Đánh dấu có thay đổi để gửi trạng thái ban đầu
+    _statusChanged = true;
+    
     Serial.println("RelayManager initialized with " + String(_numRelays) + " relays");
 }
 
@@ -36,6 +40,9 @@ void RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) 
     
     // Lấy mutex trước khi truy cập dữ liệu dùng chung
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+        bool stateChanged = (_relayStatus[relayIndex].state != state);
+        bool durationChanged = (state && _relayStatus[relayIndex].endTime != millis() + duration && duration > 0);
+        
         if (state) {
             // Bật relay
             digitalWrite(_relayPins[relayIndex], HIGH);
@@ -55,6 +62,11 @@ void RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) 
             _relayStatus[relayIndex].state = false;
             _relayStatus[relayIndex].endTime = 0;
             Serial.println("Relay " + String(relayIndex + 1) + " turned OFF");
+        }
+        
+        // Đánh dấu có sự thay đổi nếu trạng thái hoặc thời gian thay đổi
+        if (stateChanged || durationChanged) {
+            _statusChanged = true;
         }
         
         xSemaphoreGive(_mutex);
@@ -109,6 +121,7 @@ unsigned long RelayManager::getRemainingTime(int relayIndex) {
 void RelayManager::update() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
         unsigned long currentTime = millis();
+        bool anyRelayChanged = false;
         
         for (int i = 0; i < _numRelays; i++) {
             // Kiểm tra nếu relay đang bật và có thời gian
@@ -119,10 +132,16 @@ void RelayManager::update() {
                     digitalWrite(_relayPins[i], LOW);
                     _relayStatus[i].state = false;
                     _relayStatus[i].endTime = 0;
+                    anyRelayChanged = true;
                     
                     Serial.println("Auto turned OFF relay " + String(i + 1) + " (timer expired)");
                 }
             }
+        }
+        
+        // Đánh dấu có sự thay đổi nếu có relay nào đó tự động tắt
+        if (anyRelayChanged) {
+            _statusChanged = true;
         }
         
         xSemaphoreGive(_mutex);
@@ -198,23 +217,43 @@ bool RelayManager::processCommand(const char* json) {
             // Kiểm tra nếu có duration
             if (relay.containsKey("duration") && state) {
                 duration = relay["duration"];
+                // Convert seconds to milliseconds if needed
+                if (duration < 10000) {
+                    duration *= 1000;
+                }
             }
             
-            // Chuyển từ id (1-6) sang index (0-5)
-            int relayIndex = id - 1;
-            
-            // Kiểm tra id hợp lệ
-            if (relayIndex >= 0 && relayIndex < _numRelays) {
-                // Thiết lập relay
-                setRelay(relayIndex, state, duration);
-                anyChanges = true;
+            // Điều khiển relay (0-based index, nhưng id là 1-based)
+            if (id >= 1 && id <= _numRelays) {
+                int relayIndex = id - 1;
+                
+                // Kiểm tra xem có sự thay đổi không trước khi cập nhật
+                bool currentState = _relayStatus[relayIndex].state;
+                unsigned long currentEndTime = _relayStatus[relayIndex].endTime;
+                bool willChange = (currentState != state) || 
+                                (state && duration > 0 && 
+                                 (currentEndTime == 0 || currentEndTime != millis() + duration));
+                
+                if (willChange) {
+                    setRelay(relayIndex, state, duration);
+                    anyChanges = true;
+                }
             } else {
                 Serial.println("Invalid relay ID: " + String(id));
             }
-        } else {
-            Serial.println("Relay command missing 'id' or 'state' field");
         }
     }
     
     return anyChanges;
+}
+
+bool RelayManager::hasStatusChangedAndReset() {
+    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+        bool changed = _statusChanged;
+        _statusChanged = false; // Reset cờ
+        xSemaphoreGive(_mutex);
+        return changed;
+    }
+    // Fallback nếu không lấy được mutex
+    return true;
 } 

@@ -23,14 +23,10 @@ void EnvironmentManager::update() {
     }
     _lastUpdateTime = currentTime;
     
-    // Đọc nhiệt độ, độ ẩm từ SensorManager
-    if (_sensorManager.readSensors()) {
-        _temperature = _sensorManager.getTemperature();
-        _humidity = _sensorManager.getHumidity();
-        _heatIndex = _sensorManager.getHeatIndex();
-    }
+    // KHÔNG đọc nhiệt độ, độ ẩm từ SensorManager ở đây nữa
+    // Dữ liệu nhiệt độ, độ ẩm, chỉ số nhiệt từ DHT sẽ được đẩy từ main.cpp
     
-    // Các cảm biến khác hiện chưa có, sẽ được cập nhật sau khi kết nối
+    // Các cảm biến khác hoặc logic xử lý khác có thể được thêm vào đây
 }
 
 float EnvironmentManager::getTemperature() {
@@ -61,6 +57,21 @@ bool EnvironmentManager::isRaining() {
 
 int EnvironmentManager::getLightLevel() {
     return _lightLevel;
+}
+
+// Setter cho nhiệt độ từ bên ngoài
+void EnvironmentManager::setCurrentTemperature(float temp) {
+    _temperature = temp;
+}
+
+// Setter cho độ ẩm từ bên ngoài
+void EnvironmentManager::setCurrentHumidity(float hum) {
+    _humidity = hum;
+}
+
+// Setter cho chỉ số nhiệt từ bên ngoài
+void EnvironmentManager::setCurrentHeatIndex(float hi) {
+    _heatIndex = hi;
 }
 
 void EnvironmentManager::setSoilMoisture(int zone, float value) {

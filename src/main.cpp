@@ -68,10 +68,8 @@ TaskScheduler taskScheduler(relayManager, envManager);
 // Time tracking variables
 unsigned long lastSensorReadTime = 0;
 const unsigned long sensorReadInterval = 5000;  // Read sensors and send data every 5 seconds
-unsigned long lastStatusReportTime = 0;
-const unsigned long statusReportInterval = 10000;  // Send status every 10 seconds
-unsigned long lastScheduleCheckTime = 0;
-const unsigned long scheduleCheckInterval = 1000;  // Check schedule every 1 second
+unsigned long lastForcedStatusReportTime = 0;
+const unsigned long forcedStatusReportInterval = 5 * 60 * 1000;  // Force status update every 5 minutes
 unsigned long lastEnvUpdateTime = 0;
 const unsigned long envUpdateInterval = 2000;  // Update environment readings every 2 seconds
 
@@ -117,20 +115,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   
   // Process message based on topic
   if (strcmp(topic, MQTT_TOPIC_CONTROL) == 0) {
-    // Process relay control command
-    if (relayManager.processCommand(message)) {
-      // If command was processed successfully, publish status
-      String statusPayload = relayManager.getStatusJson(API_KEY);
-      networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
-    }
+    // Process relay control command - không publish ngay, để do phát hiện thay đổi
+    relayManager.processCommand(message);
   }
   else if (strcmp(topic, MQTT_TOPIC_SCHEDULE) == 0) {
-    // Process scheduling command
-    if (taskScheduler.processCommand(message)) {
-      // If schedule was processed successfully, publish schedule status
-      String schedulePayload = taskScheduler.getTasksJson(API_KEY);
-      networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
-    }
+    // Process scheduling command - không publish ngay, để do phát hiện thay đổi
+    taskScheduler.processCommand(message);
   }
   else if (strcmp(topic, MQTT_TOPIC_ENV_CONTROL) == 0) {
     // Process environment control command
@@ -172,12 +162,6 @@ void Core0TaskCode(void * parameter) {
     
     unsigned long currentTime = millis();
     
-    // Update environment manager
-    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
-      lastEnvUpdateTime = currentTime;
-      envManager.update();
-    }
-    
     // Read data from sensors and send to MQTT server
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
       lastSensorReadTime = currentTime;
@@ -186,6 +170,11 @@ void Core0TaskCode(void * parameter) {
       if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
         // Read data from sensors
         if (sensorManager.readSensors()) {
+          // Cập nhật ngay vào EnvironmentManager
+          envManager.setCurrentTemperature(sensorManager.getTemperature());
+          envManager.setCurrentHumidity(sensorManager.getHumidity());
+          envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
+          
           // Print data to Serial for debugging
           Serial.print("Temperature: ");
           Serial.print(sensorManager.getTemperature());
@@ -222,24 +211,42 @@ void Core0TaskCode(void * parameter) {
       }
     }
     
-    // Send relay status periodically
-    if (currentTime - lastStatusReportTime >= statusReportInterval) {
-      lastStatusReportTime = currentTime;
+    // Update environment manager (cho các logic khác ngoài việc lấy từ DHT)
+    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
+      lastEnvUpdateTime = currentTime;
+      envManager.update();
+    }
+    
+    // Publish relay and scheduler status khi có thay đổi hoặc cần gửi dự phòng
+    if (networkManager.isConnected()) {
+      bool forcedReport = (currentTime - lastForcedStatusReportTime >= forcedStatusReportInterval);
       
-      if (networkManager.isConnected()) {
-        // Send relay status
+      // Publish relay status khi có thay đổi hoặc gửi dự phòng
+      if (relayManager.hasStatusChangedAndReset() || forcedReport) {
         String statusPayload = relayManager.getStatusJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
-        
-        // Send schedule status
+      }
+      
+      // Publish schedule status khi có thay đổi hoặc gửi dự phòng
+      if (taskScheduler.hasScheduleStatusChangedAndReset() || forcedReport) {
         String schedulePayload = taskScheduler.getTasksJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
       }
+      
+      // Cập nhật thời gian gửi dự phòng nếu đã gửi dự phòng
+      if (forcedReport) {
+        lastForcedStatusReportTime = currentTime;
+      }
     }
     
-    // Check and update irrigation schedules
-    if (currentTime - lastScheduleCheckTime >= scheduleCheckInterval) {
-      lastScheduleCheckTime = currentTime;
+    // Check and update irrigation schedules - Event-driven approach
+    time_t current_time_for_scheduler;
+    time(&current_time_for_scheduler);
+    time_t next_check = taskScheduler.getEarliestNextCheckTime();
+    
+    if (next_check == 0 || current_time_for_scheduler >= next_check) {
+      // Nếu next_check là 0 (chưa có lịch, hoặc cần tính toán lại lần đầu)
+      // hoặc đã đến/qua thời điểm kiểm tra
       taskScheduler.update();
     }
     

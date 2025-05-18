@@ -25,6 +25,11 @@ public:
     void setRainStatus(bool isRaining);
     void setLightLevel(int level);
     
+    // Cập nhật giá trị cảm biến DHT từ bên ngoài
+    void setCurrentTemperature(float temp);
+    void setCurrentHumidity(float hum);
+    void setCurrentHeatIndex(float hi);
+    
 private:
     SensorManager& _sensorManager;
     
