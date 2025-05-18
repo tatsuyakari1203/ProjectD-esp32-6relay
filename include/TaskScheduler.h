@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <bitset>
 #include "RelayManager.h"
 #include "EnvironmentManager.h"
 
@@ -89,7 +90,7 @@ private:
     RelayManager& _relayManager;
     EnvironmentManager& _envManager;
     std::vector<IrrigationTask> _tasks;      // Danh sách lịch
-    std::vector<uint8_t> _activeZones;       // Các vùng đang hoạt động
+    std::bitset<6> _activeZonesBits;         // Các vùng đang hoạt động (bit 0-5 đại diện zone 1-6)
     SemaphoreHandle_t _mutex;
     unsigned long _lastCheckTime;            // Thời điểm kiểm tra gần nhất
     time_t _earliestNextCheckTime;           // Thời điểm sớm nhất cần kiểm tra lại lịch

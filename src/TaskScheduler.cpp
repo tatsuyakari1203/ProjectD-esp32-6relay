@@ -11,7 +11,7 @@ void TaskScheduler::begin() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
         // Khởi tạo danh sách lịch rỗng
         _tasks.clear();
-        _activeZones.clear();
+        _activeZonesBits.reset(); // Xóa tất cả các bit (tất cả zone không hoạt động)
         _earliestNextCheckTime = 0;
         _scheduleStatusChanged = true; // Đánh dấu có thay đổi để gửi trạng thái ban đầu
         
@@ -627,8 +627,8 @@ void TaskScheduler::startTask(IrrigationTask& task) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOn(relayIndex, task.duration * 60 * 1000);
             
-            // Thêm vào danh sách vùng đang hoạt động
-            _activeZones.push_back(zoneId);
+            // Đánh dấu bit tương ứng với zone đang hoạt động (dùng 0-based index)
+            _activeZonesBits.set(zoneId - 1);
         }
     }
     
@@ -652,11 +652,8 @@ void TaskScheduler::stopTask(IrrigationTask& task) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOff(relayIndex);
             
-            // Xóa khỏi danh sách vùng đang hoạt động
-            _activeZones.erase(std::remove(_activeZones.begin(), 
-                                         _activeZones.end(), 
-                                         zoneId), 
-                             _activeZones.end());
+            // Reset bit tương ứng với zone đang hoạt động (dùng 0-based index)
+            _activeZonesBits.reset(zoneId - 1);
         }
     }
     
@@ -664,7 +661,12 @@ void TaskScheduler::stopTask(IrrigationTask& task) {
 }
 
 bool TaskScheduler::isZoneBusy(uint8_t zoneId) {
-    return std::find(_activeZones.begin(), _activeZones.end(), zoneId) != _activeZones.end();
+    if (zoneId >= 1 && zoneId <= 6) {
+        // Kiểm tra bit tương ứng với zone (dùng 0-based index)
+        return _activeZonesBits.test(zoneId - 1);
+    }
+    Serial.println("ERROR: Invalid zoneId in isZoneBusy: " + String(zoneId));
+    return false; // Zone ID không hợp lệ
 }
 
 bool TaskScheduler::isHigherPriority(int taskId) {
