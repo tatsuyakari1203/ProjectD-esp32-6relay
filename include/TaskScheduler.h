@@ -82,6 +82,9 @@ public:
     // Lấy thời điểm sớm nhất cần kiểm tra lịch
     time_t getEarliestNextCheckTime() const;
     
+    // Kiểm tra xem lịch trình có thay đổi không và reset cờ
+    bool hasScheduleStatusChangedAndReset();
+    
 private:
     RelayManager& _relayManager;
     EnvironmentManager& _envManager;
@@ -90,6 +93,7 @@ private:
     SemaphoreHandle_t _mutex;
     unsigned long _lastCheckTime;            // Thời điểm kiểm tra gần nhất
     time_t _earliestNextCheckTime;           // Thời điểm sớm nhất cần kiểm tra lại lịch
+    bool _scheduleStatusChanged;             // Cờ đánh dấu thay đổi lịch trình
     
     // Phương thức đơn giản
     void checkTasks();                       // Kiểm tra lịch đến giờ
