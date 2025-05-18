@@ -170,12 +170,6 @@ void Core0TaskCode(void * parameter) {
     
     unsigned long currentTime = millis();
     
-    // Update environment manager
-    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
-      lastEnvUpdateTime = currentTime;
-      envManager.update();
-    }
-    
     // Read data from sensors and send to MQTT server
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
       lastSensorReadTime = currentTime;
@@ -184,6 +178,11 @@ void Core0TaskCode(void * parameter) {
       if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
         // Read data from sensors
         if (sensorManager.readSensors()) {
+          // Cập nhật ngay vào EnvironmentManager
+          envManager.setCurrentTemperature(sensorManager.getTemperature());
+          envManager.setCurrentHumidity(sensorManager.getHumidity());
+          envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
+          
           // Print data to Serial for debugging
           Serial.print("Temperature: ");
           Serial.print(sensorManager.getTemperature());
@@ -218,6 +217,12 @@ void Core0TaskCode(void * parameter) {
         // Release mutex after accessing sensor data
         xSemaphoreGive(sensorDataMutex);
       }
+    }
+    
+    // Update environment manager (cho các logic khác ngoài việc lấy từ DHT)
+    if (currentTime - lastEnvUpdateTime >= envUpdateInterval) {
+      lastEnvUpdateTime = currentTime;
+      envManager.update();
     }
     
     // Send relay status periodically
