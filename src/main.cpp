@@ -244,7 +244,11 @@ void Core0TaskCode(void * parameter) {
             unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
             AppLogger.perf("Core0", "MQTTSensorDataPublish", mqttPublishDuration, mqttSuccess);
             
-            AppLogger.debug("Core0", "Sensor data published to MQTT");
+            if (mqttSuccess) {
+              AppLogger.debug("Core0", "Sensor data published to MQTT successfully.");
+            } else {
+              AppLogger.error("Core0", "Failed to publish sensor data to MQTT.");
+            }
           } else {
             AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
             // LED status handled globally below
@@ -509,8 +513,8 @@ void loop() {
     lastStackCheckTime = millis();
     UBaseType_t core0StackHWM = uxTaskGetStackHighWaterMark(core0Task);
     UBaseType_t core1StackHWM = uxTaskGetStackHighWaterMark(core1Task);
-    AppLogger.info("StackCheck", "Core0Task HWM: " + String(core0StackHWM) + " words (" + String(core0StackHWM * sizeof(StackType_t)) + " bytes)");
-    AppLogger.info("StackCheck", "Core1Task HWM: " + String(core1StackHWM) + " words (" + String(core1StackHWM * sizeof(StackType_t)) + " bytes)");
+    AppLogger.info("StackCheck", "Core0Task Min Free Stack: " + String(core0StackHWM) + " words (" + String(core0StackHWM * sizeof(StackType_t)) + " bytes)");
+    AppLogger.info("StackCheck", "Core1Task Min Free Stack: " + String(core1StackHWM) + " words (" + String(core1StackHWM * sizeof(StackType_t)) + " bytes)");
     // Lưu ý: "words" ở đây là StackType_t, thường là 4 byte trên ESP32.
     // Dựa vào kết quả này, bạn có thể điều chỉnh STACK_SIZE_CORE0 và STACK_SIZE_CORE1.
     // Ví dụ, nếu HWM là 1000 words (4000 bytes) và STACK_SIZE là 8192 bytes, bạn có thể giảm STACK_SIZE.

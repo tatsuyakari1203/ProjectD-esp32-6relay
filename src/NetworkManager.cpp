@@ -221,6 +221,15 @@ bool NetworkManager::_connectMqtt() {
         _mqttConnected = false;
         return false;
     }
+
+    // Ensure _wifiClient is explicitly stopped if it's in a lingering connected state
+    // before PubSubClient attempts to use it for a new connection.
+    if (_wifiClient.connected()) {
+        AppLogger.warning("NetMgr", "MQTT: _wifiClient was found connected before new MQTT connect attempt. Stopping it first.");
+        _wifiClient.stop();
+        delay(100); // Short delay to allow the stop to process
+    }
+
     AppLogger.info("NetMgr", "MQTT: Attempting connection to " + String(_mqttServer) + ":" + String(_mqttPort) + " as " + String(_clientId));
     _isAttemptingMqttReconnect = true; // Mark that we are trying
 
@@ -452,15 +461,38 @@ bool NetworkManager::publish(const char* topic, const char* payload) {
         AppLogger.warning("NetMgr", "MQTT: Cannot publish, network not fully connected. Topic: " + String(topic));
         return false;
     }
+
+    int currentState = _mqttClient.state();
+    AppLogger.debug("NetMgr", "MQTT: Attempting to publish. Topic: '" + String(topic) + "', Payload len: " + String(strlen(payload)) + ", Current MQTT State: " + String(currentState));
+
     // Check payload size against the buffer size (1024 in this case)
     // PubSubClient's default MQTT_MAX_PACKET_SIZE is 256. If setBufferSize(1024) was used, this check is against that.
-    // MQTT header can take some space.
     const int mqttOverheadEstimate = 50; // Estimate for topic name, QoS, etc.
     if (strlen(payload) > (1024 - mqttOverheadEstimate)) { 
          AppLogger.warning("NetMgr", "MQTT: Payload for topic '" + String(topic) + "' might be too large for buffer (1024 bytes). Length: " + String(strlen(payload)));
     }
+    
+    bool success = _mqttClient.publish(topic, payload);
+
+    if (!success) {
+        int stateAfterFail = _mqttClient.state();
+        AppLogger.error("NetMgr", "MQTT: Publish failed! Topic: '" + String(topic) + "', MQTT State after fail: " + String(stateAfterFail));
+
+        // If publish fails, assume connection is compromised and disconnect to allow robust reconnection.
+        if (_mqttConnected) { // Only if we previously thought we were connected
+            AppLogger.warning("NetMgr", "MQTT: Publish failure detected. Forcing MQTT disconnect and scheduling reconnect.");
+            _mqttClient.disconnect(); // This sets PubSubClient state to MQTT_DISCONNECTED (-1) and closes socket.
+            _mqttConnected = false; // Update our manager's state
+            
+            // Schedule reconnection attempt
+            _isAttemptingMqttReconnect = true;
+            _nextMqttRetryTime = millis(); // Try to reconnect in the next loop iteration
+            _mqttRetryCount = 0;           // Reset retry count for a fresh series of attempts
+            _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
+        }
+    }
     // AppLogger.debug("NetMgr", "MQTT: Publishing to: " + String(topic)); 
-    return _mqttClient.publish(topic, payload);
+    return success;
 }
 
 bool NetworkManager::subscribe(const char* topic) {
