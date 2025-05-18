@@ -5,10 +5,9 @@
 // Define the global AppLogger variable
 Logger AppLogger;
 
-// API key from main.cpp
-extern const char* API_KEY;
+// extern const char* API_KEY; // REMOVED
 
-Logger::Logger() : _networkManager(nullptr), _serialLogLevel(LOG_LEVEL_NONE), _mqttLogLevel(LOG_LEVEL_NONE), _apiKey(nullptr) {
+Logger::Logger() : _networkManager(nullptr), _serialLogLevel(LOG_LEVEL_NONE), _mqttLogLevel(LOG_LEVEL_NONE), _apiKey("") { // MODIFIED: Initialize _apiKey
     // Default constructor
 }
 
@@ -17,8 +16,18 @@ void Logger::begin(NetworkManager* networkManager, LogLevel initialSerialLogLeve
     setSerialLogLevel(initialSerialLogLevel); // Use setter to get a log message for the change
     setMqttLogLevel(initialMqttLogLevel);   // Use setter
 
-    // Store API key from main.cpp
-    _apiKey = API_KEY;
+    // Store API key from NetworkManager - MODIFIED
+    if (_networkManager) {
+        _apiKey = _networkManager->getApiKey();
+        if (Serial && _serialLogLevel >= LOG_LEVEL_DEBUG) {
+             Serial.println(String(millis()) + " [DEBUG] [Logger]: API Key loaded via NetworkManager. Length: " + String(_apiKey.length()));
+        }
+    } else {
+        _apiKey = ""; // Set to empty if networkManager is null
+        if (Serial && _serialLogLevel >= LOG_LEVEL_WARNING) {
+             Serial.println(String(millis()) + " [WARNING] [Logger]: NetworkManager not available during Logger init, API Key not set.");
+        }
+    }
     
     // Log Logger initialization message (will only appear if Serial is configured for INFO level or higher)
     // and Serial.begin() has been called.
@@ -127,9 +136,9 @@ void Logger::processLogEntry(const LogEntry& entry) {
 String Logger::formatToJson(const LogEntry& entry) {
     StaticJsonDocument<512> doc; // JSON size, adjust if more fields are needed
     
-    // Add API key for authentication
-    if (_apiKey != nullptr) {
-        doc["api_key"] = _apiKey;
+    // Add API key for authentication - MODIFIED
+    if (!_apiKey.isEmpty()) {
+        doc["api_key"] = _apiKey; // ArduinoJson handles String type
     }
     
     doc["timestamp"] = entry.timestamp;
@@ -230,9 +239,9 @@ void Logger::perf(const String& tag, const String& eventName, unsigned long dura
     if (shouldLogMqtt && _networkManager && _networkManager->isConnected()) {
         StaticJsonDocument<512> doc; // Adjust size as needed
         
-        // Add API key for authentication
-        if (_apiKey != nullptr) {
-            doc["api_key"] = _apiKey;
+        // Add API key for authentication - MODIFIED
+        if (!_apiKey.isEmpty()) { 
+            doc["api_key"] = _apiKey; // ArduinoJson handles String type
         }
         
         if (time(nullptr) > 1000000000L) {

@@ -27,6 +27,7 @@ const uint8_t MAX_MQTT_RETRY_ATTEMPTS = 10;
 const unsigned long INITIAL_RETRY_INTERVAL_MS = 5000;     // 5 seconds
 const unsigned long MAX_RETRY_INTERVAL_MS = 60000;        // 1 minute
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;      // 15 seconds for WiFi.begin()
+const int NTP_ATTEMPTS_PER_SERVER = 2; // Max attempts for each NTP server before trying next
 
 // THÊM VÀO: Hằng số cho AP Mode và WebServer
 // const char* AP_SSID = "ESP32-Config"; // Sẽ định nghĩa trong .cpp
@@ -42,7 +43,7 @@ extern const char* ADMIN_LOGIN_PASSWORD;
 class NetworkManager {
 public:
     NetworkManager();
-    bool begin(const char* initial_ssid, const char* initial_password, const char* mqttServer, int mqttPort);
+    bool begin(const char* initial_ssid, const char* initial_password);
     // void addSubscriptionTopic(const char* topic); // Suggestion for more flexible topic management
     bool publish(const char* topic, const char* payload);
     bool subscribe(const char* topic); // Will add to list and attempt to subscribe if connected
@@ -66,6 +67,11 @@ public:
     IPAddress getLocalIP() const; // Để lấy IP khi đã kết nối WiFi
     IPAddress getSoftAPIP() const; // Để lấy IP của AP
 
+    // Getters for the new configuration items
+    String getMqttServer() const;
+    int getMqttPort() const;
+    String getApiKey() const;
+
 private:
     WiFiClient _wifiClient;
     PubSubClient _mqttClient;
@@ -76,6 +82,7 @@ private:
     char _targetPassword[64]; // Password mục tiêu
     char _mqttServer[64];
     int _mqttPort;
+    char _apiKey[64]; // New member for API Key
     char _clientId[32];
 
     bool _wifiConnected;
@@ -113,13 +120,15 @@ private:
     // THÊM VÀO: Web server request handlers
     void _handleRoot(AsyncWebServerRequest *request);
     void _handleSave(AsyncWebServerRequest *request);
+    void _handleGetConfig(AsyncWebServerRequest *request);
+    void _handleGetSystemInfo(AsyncWebServerRequest *request);
     // void _handleScanWifi(AsyncWebServerRequest *request); // XÓA BỎ
     void _handleNotFound(AsyncWebServerRequest *request);
     void _serveStaticFile(AsyncWebServerRequest *request, const char* path, const char* contentType);
 
     // THÊM VÀO: Preferences/NVS helper
-    bool _loadCredentials(String& ssid, String& password); 
-    void _saveCredentials(const char* ssid, const char* password);
+    bool _loadNetworkConfig(); 
+    void _saveNetworkConfig();
 
     // --- XÓA BỎ PHẦN For asynchronous WiFi Scan ---
     // static void _wifiScanTaskRunner(void* pvParameters); 
@@ -130,6 +139,9 @@ private:
     // String _lastScanResultsJson;                
     // volatile bool _isScanInProgressFlag;        
     // --- KẾT THÚC PHẦN XÓA BỎ ---
+
+    std::vector<String> _ntpServerList; // List of NTP servers
+    int _currentNtpServerIndex;         // Index for the current NTP server
 };
 
 #endif // NETWORK_MANAGER_H 

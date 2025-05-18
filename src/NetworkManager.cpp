@@ -11,15 +11,38 @@ const char* AP_PASSWORD = "password123"; // Mật khẩu cho AP (có thể để
 const int WEB_SERVER_PORT = 80;
 const char* ADMIN_LOGIN_PASSWORD = "admin123";
 
+// THÊM VÀO: Default values for MQTT and API Key
+const char* DEFAULT_MQTT_SERVER = "karis.cloud";
+const int DEFAULT_MQTT_PORT = 1883;
+const char* DEFAULT_API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";
+
 NetworkManager::NetworkManager() : 
-    _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600), // 7 hours offset for Vietnam
+    _timeClient(_ntpUDP), // Initialize _timeClient without server first
     _server(WEB_SERVER_PORT), // Khởi tạo AsyncWebServer với port đã định nghĩa
     _configPortalActive(false) // Khởi tạo trạng thái portal
 {
     _wifiConnected = false;
     _mqttConnected = false;
     _timeSync = false;
-    
+    _currentNtpServerIndex = 0;
+
+    // Populate NTP server list (prioritize Vietnam, then Asia, then global)
+    _ntpServerList.push_back("vn.pool.ntp.org");
+    _ntpServerList.push_back("0.vn.pool.ntp.org");
+    _ntpServerList.push_back("1.ntp.vnix.vn");    // VNNIC Server 1
+    _ntpServerList.push_back("2.ntp.vnix.vn");    // VNNIC Server 2
+    _ntpServerList.push_back("0.asia.pool.ntp.org");
+    _ntpServerList.push_back("1.asia.pool.ntp.org");
+    _ntpServerList.push_back("pool.ntp.org");      // Global fallback
+    _ntpServerList.push_back("time.nist.gov");    // NIST as another reliable global option
+
+    // Now configure the timeClient with the first server and offset
+    // Note: NTPClient might not have a separate method to set offset after construction without also setting server.
+    // So, we re-construct/re-assign if necessary, or ensure its internal setters allow this.
+    // For now, assuming we can set pool server name and time offset independently if needed or handle it in begin.
+    // The constructor NTPClient(udp, server, offset) is common. Let's re-init with first server.
+    // The default constructor NTPClient(udp) is used above, setServerName and setTimeOffset will be used in begin().
+
     _lastWiFiReconnectAttemptTime = 0;
     _lastMqttReconnectAttemptTime = 0;
     _nextWifiRetryTime = 0;
@@ -30,6 +53,13 @@ NetworkManager::NetworkManager() :
     _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
     _isAttemptingWifiReconnect = false;
     _isAttemptingMqttReconnect = false;
+
+    // Initialize char arrays to be safe
+    _targetSsid[0] = '\0';
+    _targetPassword[0] = '\0';
+    _mqttServer[0] = '\0';
+    _apiKey[0] = '\0'; // Initialize new apiKey
+    _mqttPort = 0;
 
     // Create random clientId with timestamp for uniqueness
     uint32_t random_id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
@@ -42,7 +72,7 @@ NetworkManager::NetworkManager() :
     // KHÔNG khởi tạo _targetSsid, _targetPassword ở đây, sẽ nhận từ begin() hoặc NVS
 }
 
-bool NetworkManager::begin(const char* initial_ssid, const char* initial_password, const char* mqttServer, int mqttPort) {
+bool NetworkManager::begin(const char* initial_ssid, const char* initial_password) {
     // Ensure AppLogger is available for critical logs from this point onwards.
     // The actual AppLogger.begin() is called in main.cpp setup() before networkManager.begin().
     AppLogger.info("NetMgr", "NetworkManager::begin() called.");
@@ -50,41 +80,35 @@ bool NetworkManager::begin(const char* initial_ssid, const char* initial_passwor
 
     // Initialize Preferences here
     if (!_preferences.begin("net-config", false)) {
-        AppLogger.warning("NetMgr", "NVM: Failed to initialize Preferences in NetworkManager::begin(). WiFi credentials might not be saved/loaded.");
+        AppLogger.warning("NetMgr", "NVM: Failed to initialize Preferences in NetworkManager::begin(). Configs might not be saved/loaded.");
     } else {
         AppLogger.info("NetMgr", "NVM: Preferences initialized successfully in NetworkManager::begin().");
     }
 
-    // Lưu trữ initial credentials (có thể là rỗng nếu chưa từng cài đặt)
-    if (initial_ssid) strncpy(_targetSsid, initial_ssid, sizeof(_targetSsid) -1); else _targetSsid[0] = '\0';
-    _targetSsid[sizeof(_targetSsid)-1] = '\0';
-    if (initial_password) strncpy(_targetPassword, initial_password, sizeof(_targetPassword) -1); else _targetPassword[0] = '\0';
-    _targetPassword[sizeof(_targetPassword)-1] = '\0';
-    
-    strncpy(_mqttServer, mqttServer, sizeof(_mqttServer) -1); _mqttServer[sizeof(_mqttServer)-1] = '\0';
-    _mqttPort = mqttPort;
+    // Load all network configurations
+    bool loaded_from_nvs = _loadNetworkConfig();
 
-    AppLogger.info("NetMgr", "Initializing NetworkManager...");
-
-    // THAY ĐỔI: Load credentials từ NVS trước
-    String nvs_ssid, nvs_pass;
-    bool loaded_from_nvs = _loadCredentials(nvs_ssid, nvs_pass);
-
-    if (loaded_from_nvs) {
-        strncpy(_targetSsid, nvs_ssid.c_str(), sizeof(_targetSsid) - 1);
-        _targetSsid[sizeof(_targetSsid) - 1] = '\0';
-        strncpy(_targetPassword, nvs_pass.c_str(), sizeof(_targetPassword) - 1);
-        _targetPassword[sizeof(_targetPassword) - 1] = '\0';
-        AppLogger.info("NetMgr", "Using WiFi credentials from NVS.");
-    } else if (strlen(_targetSsid) > 0) {
-        // Nếu không có gì trong NVS, nhưng có targetSsid được truyền vào (ví dụ từ main.cpp như một default cuối cùng)
-        AppLogger.info("NetMgr", "Using initial parameters for WiFi credentials (NVS was empty).");
-    } else {
-        // Không có trong NVS và không có targetSsid -> targetSsid sẽ rỗng, sẽ kích hoạt portal
-        _targetSsid[0] = '\0';
-        _targetPassword[0] = '\0';
-        AppLogger.info("NetMgr", "No credentials in NVS or from initial parameters. Config portal will be primary.");
+    // If NVS is empty for SSID, and initial_ssid is provided, use it.
+    // This handles the case where main.cpp might pass a default if nothing is in NVS.
+    // However, for MQTT/API Key, _loadNetworkConfig will set defaults if NVS is empty.
+    if (!loaded_from_nvs || strlen(_targetSsid) == 0) {
+        if (initial_ssid && strlen(initial_ssid) > 0) {
+            strncpy(_targetSsid, initial_ssid, sizeof(_targetSsid) - 1);
+            _targetSsid[sizeof(_targetSsid) - 1] = '\0';
+            if (initial_password) { // Password can be empty
+                strncpy(_targetPassword, initial_password, sizeof(_targetPassword) - 1);
+                _targetPassword[sizeof(_targetPassword) - 1] = '\0';
+            } else {
+                _targetPassword[0] = '\0';
+            }
+            AppLogger.info("NetMgr", "Using initial parameters for WiFi credentials (NVS was empty or no SSID).");
+        } else {
+            AppLogger.info("NetMgr", "No credentials in NVS or from initial parameters. Config portal will be primary for WiFi.");
+            // _targetSsid will be empty, portal will be triggered
+        }
     }
+    
+    AppLogger.info("NetMgr", "Current Config: SSID='" + String(_targetSsid) + "', MQTT Server='" + String(_mqttServer) + ":" + String(_mqttPort) + "', APIKey='" + String(_apiKey) + "'");
 
     // Initialize SPIFFS
     AppLogger.info("NetMgr", "Initializing SPIFFS...");
@@ -121,6 +145,14 @@ bool NetworkManager::begin(const char* initial_ssid, const char* initial_passwor
         AppLogger.debug("WebServer", "POST /save");
         this->_handleSave(request);
     });
+    _server.on("/getconfig", HTTP_GET, [this](AsyncWebServerRequest *request){
+        AppLogger.debug("WebServer", "GET /getconfig");
+        this->_handleGetConfig(request);
+    });
+    _server.on("/getsysteminfo", HTTP_GET, [this](AsyncWebServerRequest *request){
+        AppLogger.debug("WebServer", "GET /getsysteminfo");
+        this->_handleGetSystemInfo(request);
+    });
     _server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request){
         AppLogger.debug("WebServer", "GET /favicon.ico - Sending 204 No Content");
         request->send(204);
@@ -149,52 +181,66 @@ bool NetworkManager::begin(const char* initial_ssid, const char* initial_passwor
     }
 
     if (connectedViaStoredCredentials) {
-        // NTP Synchronization with retries
-        _timeClient.begin(); // Initialize the NTP client
-        AppLogger.info("NetMgr", "Attempting NTP time synchronization...");
-        int ntp_retries = 0;
-        const int max_ntp_retries = 10; // Try up to 10 times
-        const unsigned long ntp_retry_interval_ms = 2000; // Wait 2 seconds between retries
+        // NTP Synchronization with retries and server failover
+        // _timeClient.begin(); // Initialize the NTP client - NO, will be called per server
+        _timeClient.setTimeOffset(7 * 3600); // Set Vietnam offset (GMT+7) once
+
+        AppLogger.info("NetMgr", "Attempting NTP time synchronization with server failover...");
+        int ntp_global_retries = 0;
+        const int max_ntp_global_retries = _ntpServerList.size() * NTP_ATTEMPTS_PER_SERVER; // Max total attempts across all servers
         bool ntp_synced = false;
 
-        while(!ntp_synced && ntp_retries < max_ntp_retries) {
-            AppLogger.debug("NetMgr", "NTP sync attempt " + String(ntp_retries + 1) + " of " + String(max_ntp_retries) + "...");
-            if (syncTime()) { // syncTime() likely calls _timeClient.forceUpdate()
-            AppLogger.info("NetMgr", "Time synchronized via NTP.");
-            _timeSync = true;
-                ntp_synced = true;
-                // Set system time using the epoch from NTPClient if syncTime() was successful
-                // This assumes syncTime() updates the underlying NTPClient's state correctly.
-                // And that _timeClient is the NTPClient instance.
-                time_t epochTime = _timeClient.getEpochTime(); 
-                struct timeval tv;
-                tv.tv_sec = epochTime;
-                tv.tv_usec = 0;
-                if (settimeofday(&tv, nullptr) == 0) {
-                    AppLogger.info("NetMgr", "System time set to: " + _timeClient.getFormattedTime() + " (UTC)");
-                    // Now set the timezone environment variable for C library functions
-                    setenv("TZ", "Asia/Ho_Chi_Minh", 1); // TZ for Vietnam GMT+7
-                    tzset(); // Apply the TZ environment variable
-                    AppLogger.info("NetMgr", "Timezone set to Asia/Ho_Chi_Minh. Local time functions should now be correct.");
-                    // You can verify with a localtime call if needed for debugging here
-                    // struct tm timeinfo_check;
-                    // getLocalTime(&timeinfo_check, 0); // Get time from RTC immediately
-                    // AppLogger.debug("NetMgr", "Sample local time: " + String(asctime(&timeinfo_check)));
+        while(!ntp_synced && ntp_global_retries < max_ntp_global_retries) {
+            const char* current_server_name = _ntpServerList[_currentNtpServerIndex].c_str();
+            AppLogger.info("NetMgr", "NTP: Using server: " + String(current_server_name) + " (Attempt " + String(ntp_global_retries + 1) + "/" + String(max_ntp_global_retries) + ")");
+            
+            _timeClient.setPoolServerName(current_server_name); // Set server for NTPClient
+            _timeClient.begin(); // Initialize UDP for the current server. Important for server changes.
+
+            int attempts_on_this_server = 0;
+            while(attempts_on_this_server < NTP_ATTEMPTS_PER_SERVER && !ntp_synced) {
+                AppLogger.debug("NetMgr", "NTP: Attempt " + String(attempts_on_this_server + 1) + "/" + String(NTP_ATTEMPTS_PER_SERVER) + " with " + String(current_server_name));
+                if (_timeClient.forceUpdate()) {
+                    AppLogger.info("NetMgr", "NTP: Time synchronized with " + String(current_server_name));
+                    _timeSync = true;
+                    ntp_synced = true;
+                    time_t epochTime = _timeClient.getEpochTime(); 
+                    struct timeval tv;
+                    tv.tv_sec = epochTime;
+                    tv.tv_usec = 0;
+                    if (settimeofday(&tv, nullptr) == 0) {
+                        AppLogger.info("NetMgr", "NTP: System time set to: " + _timeClient.getFormattedTime() + " (UTC)");
+                        setenv("TZ", "Asia/Ho_Chi_Minh", 1);
+                        tzset();
+                        AppLogger.info("NetMgr", "NTP: Timezone set to Asia/Ho_Chi_Minh.");
+                    } else {
+                        AppLogger.error("NetMgr", "NTP: Failed to set system time.");
+                    }
+                    break; // Break from inner loop (attempts_on_this_server)
                 } else {
-                    AppLogger.error("NetMgr", "Failed to set system time.");
+                    AppLogger.warning("NetMgr", "NTP: Sync attempt " + String(attempts_on_this_server + 1) + " failed with " + String(current_server_name));
+                    attempts_on_this_server++;
+                    ntp_global_retries++; // Also increment global counter here
+                    if (attempts_on_this_server < NTP_ATTEMPTS_PER_SERVER && ntp_global_retries < max_ntp_global_retries) {
+                        delay(1000); // Wait 1 sec before quick retry on same server
+                    }
                 }
-        } else {
-                AppLogger.warning("NetMgr", "NTP sync attempt " + String(ntp_retries + 1) + " failed.");
-                ntp_retries++;
-                if (ntp_retries < max_ntp_retries) {
-                    delay(ntp_retry_interval_ms);
+            } // End while attempts_on_this_server
+
+            if (!ntp_synced) {
+                _currentNtpServerIndex = (_currentNtpServerIndex + 1) % _ntpServerList.size();
+                if (ntp_global_retries < max_ntp_global_retries) {
+                     AppLogger.warning("NetMgr", "NTP: Failed to sync with " + String(current_server_name) + " after " + String(NTP_ATTEMPTS_PER_SERVER) + " attempts. Trying next server.");
+                     delay(2000); // Wait 2 secs before trying next server
                 }
+            } else {
+                // NTP Synced, break the main while loop
+                break;
             }
-        }
+        } // End while !ntp_synced && ntp_global_retries < max_ntp_global_retries
 
         if (!ntp_synced) {
-            AppLogger.error("NetMgr", "NTP time synchronization failed after " + String(max_ntp_retries) + " retries.");
-            // _timeSync remains false
+            AppLogger.error("NetMgr", "NTP: Time synchronization failed after all attempts with all servers.");
         }
         
         _mqttClient.setClient(_wifiClient);
@@ -586,6 +632,9 @@ void NetworkManager::_handleNotFound(AsyncWebServerRequest *request) {
 void NetworkManager::_handleSave(AsyncWebServerRequest *request) {
     String new_ssid_str = "";
     String new_pass_str = "";
+    String new_mqtt_server_str = "";
+    String new_mqtt_port_str = "";
+    String new_api_key_str = "";
 
     if (request->hasParam("ssid", true)) {
         new_ssid_str = request->getParam("ssid", true)->value();
@@ -593,8 +642,21 @@ void NetworkManager::_handleSave(AsyncWebServerRequest *request) {
     if (request->hasParam("pass", true)) {
         new_pass_str = request->getParam("pass", true)->value();
     }
+    if (request->hasParam("mqtt_server", true)) {
+        new_mqtt_server_str = request->getParam("mqtt_server", true)->value();
+    }
+    if (request->hasParam("mqtt_port", true)) {
+        new_mqtt_port_str = request->getParam("mqtt_port", true)->value();
+    }
+    if (request->hasParam("api_key", true)) {
+        new_api_key_str = request->getParam("api_key", true)->value();
+    }
 
-    AppLogger.info("WebServer", "Save request: SSID='" + new_ssid_str + "', Password specified: " + String(new_pass_str.length() > 0 ? "Yes" : "No"));
+    AppLogger.info("WebServer", "Save request: SSID='" + new_ssid_str + 
+                                "', MQTT_Server='" + new_mqtt_server_str + 
+                                "', MQTT_Port='" + new_mqtt_port_str + 
+                                "', API_Key specified: " + String(new_api_key_str.length() > 0 ? "Yes" : "No") +
+                                ", Password specified: " + String(new_pass_str.length() > 0 ? "Yes" : "No"));
 
     if (new_ssid_str.length() > 0 && new_ssid_str.length() < sizeof(_targetSsid)) {
         strncpy(_targetSsid, new_ssid_str.c_str(), sizeof(_targetSsid) - 1);
@@ -603,24 +665,59 @@ void NetworkManager::_handleSave(AsyncWebServerRequest *request) {
         strncpy(_targetPassword, new_pass_str.c_str(), sizeof(_targetPassword) - 1);
         _targetPassword[sizeof(_targetPassword) - 1] = '\0';
         
-        AppLogger.info("NetMgr", "New WiFi credentials received: SSID='" + String(_targetSsid) + "'");
+        // Update MQTT Server if provided and valid
+        if (new_mqtt_server_str.length() > 0 && new_mqtt_server_str.length() < sizeof(_mqttServer)) {
+            strncpy(_mqttServer, new_mqtt_server_str.c_str(), sizeof(_mqttServer) - 1);
+            _mqttServer[sizeof(_mqttServer) - 1] = '\0';
+        } else if (new_mqtt_server_str.length() >= sizeof(_mqttServer)) {
+            AppLogger.warning("WebServer", "MQTT Server string too long, not updated.");
+        } // If empty, retain current _mqttServer (loaded from NVS or default)
+
+        // Update MQTT Port if provided and valid
+        if (new_mqtt_port_str.length() > 0) {
+            int port_val = new_mqtt_port_str.toInt();
+            if (port_val > 0 && port_val <= 65535) {
+                _mqttPort = port_val;
+            } else {
+                AppLogger.warning("WebServer", "Invalid MQTT Port received, not updated.");
+            }
+        } // If empty, retain current _mqttPort
+
+        // Update API Key if provided and valid
+        if (new_api_key_str.length() > 0 && new_api_key_str.length() < sizeof(_apiKey)) {
+            strncpy(_apiKey, new_api_key_str.c_str(), sizeof(_apiKey) - 1);
+            _apiKey[sizeof(_apiKey) - 1] = '\0';
+        } else if (new_api_key_str.length() >= sizeof(_apiKey)) {
+            AppLogger.warning("WebServer", "API Key string too long, not updated.");
+        } // If empty, retain current _apiKey
+
+        AppLogger.info("NetMgr", "New Config: SSID='" + String(_targetSsid) + 
+                                   "', MQTT Server='" + String(_mqttServer) + ":" + String(_mqttPort) + 
+                                   "', APIKey='" + String(_apiKey) + "'");
         
-        // THÊM VÀO: Lưu credentials vào NVS
-        _saveCredentials(_targetSsid, _targetPassword);
+        _saveNetworkConfig(); // Save all current settings
 
         request->send(200, "text/plain", "Đã lưu cài đặt. Đang thử kết nối với WiFi mới...");
         
         AppLogger.info("NetMgr", "Deactivating AP mode (if active) and attempting connection to: " + String(_targetSsid));
+
         if (_configPortalActive) {
-            WiFi.softAPdisconnect(true); 
+            WiFi.softAPdisconnect(true); // Stop AP
+            delay(100); // Allow time for AP to shut down
             _configPortalActive = false;
-            delay(100); 
         }
         
+        // Ensure STA mode is explicitly set before attempting connection
+        WiFi.mode(WIFI_STA);
+        delay(100); // Allow time for mode switch
+
+        // Reset WiFi connection state and attempt connection
+        _wifiConnected = false; 
+        _mqttConnected = false; // MQTT will need to reconnect after WiFi
         _wifiRetryCount = 0; 
         _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
         _isAttemptingWifiReconnect = true; 
-        _nextWifiRetryTime = millis(); 
+        _nextWifiRetryTime = millis(); // Try immediately
 
     } else {
         AppLogger.warning("WebServer", "Invalid SSID received from save request.");
@@ -628,39 +725,156 @@ void NetworkManager::_handleSave(AsyncWebServerRequest *request) {
     }
 }
 
-// THÊM VÀO: Implement _loadCredentials
-bool NetworkManager::_loadCredentials(String& ssid, String& password) {
-    if (!_preferences.isKey("wifi_ssid")) {
-        AppLogger.info("NVM", "No SSID found in NVS.");
-        ssid = "";
-        password = "";
-        return false; // Không có key, nghĩa là chưa lưu gì
-    }
-    ssid = _preferences.getString("wifi_ssid", "");
-    password = _preferences.getString("wifi_pass", "");
-    AppLogger.info("NVM", "Loaded SSID from NVS: '" + ssid + "'");
-    // Không log mật khẩu
-    return ssid.length() > 0; // Trả về true nếu SSID không rỗng
+// NEW: Handler for /getconfig
+void NetworkManager::_handleGetConfig(AsyncWebServerRequest *request) {
+    StaticJsonDocument<512> doc; // Adjust size as needed
+    doc["ssid"] = String(_targetSsid);
+    // Do not send back the password for security reasons, even if stored.
+    // The client should always re-enter it if they want to change it.
+    // doc["pass"] = String(_targetPassword); // OMITTED FOR SECURITY
+    doc["mqtt_server"] = String(_mqttServer);
+    doc["mqtt_port"] = _mqttPort;
+    doc["api_key"] = String(_apiKey);
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+    AppLogger.info("WebServer", "Sent current config (excluding password).");
 }
 
-// THÊM VÀO: Implement _saveCredentials
-void NetworkManager::_saveCredentials(const char* ssid, const char* password) {
-    if (ssid == nullptr || password == nullptr) {
-        AppLogger.error("NVM", "Cannot save null SSID or Password.");
-        return;
-    }
-    bool ssid_saved = _preferences.putString("wifi_ssid", ssid);
-    bool pass_saved = _preferences.putString("wifi_pass", password);
+// NEW: Handler for /getsysteminfo
+void NetworkManager::_handleGetSystemInfo(AsyncWebServerRequest *request) {
+    StaticJsonDocument<512> doc; // Adjust size as needed
 
-    if (ssid_saved && pass_saved) {
-        AppLogger.info("NVM", "WiFi credentials saved to NVS: SSID='" + String(ssid) + "'");
+    uint64_t chipId = ESP.getEfuseMac();
+    char deviceIdStr[18]; // 17 chars for MAC + null terminator
+    snprintf(deviceIdStr, sizeof(deviceIdStr), "%04X%08X", 
+             (uint16_t)(chipId >> 32),    // High 2 bytes
+             (uint32_t)chipId);            // Low 4 bytes
+    doc["deviceId"] = String(deviceIdStr);
+
+    doc["firmwareVersion"] = "1.0.1"; // Example version, make this dynamic if needed
+
+    if (isConfigPortalActive()) {
+        doc["wifiStatus"] = "AP Mode Active";
+        doc["ipAddress"] = getSoftAPIP().toString();
+    } else if (isWifiConnected()) {
+        doc["wifiStatus"] = "Connected to " + String(_targetSsid);
+        doc["ipAddress"] = getLocalIP().toString();
     } else {
-        AppLogger.error("NVM", "Failed to save WiFi credentials to NVS.");
-        if(!ssid_saved) AppLogger.error("NVM", "SSID save failed.");
-        if(!pass_saved) AppLogger.error("NVM", "Password save failed.");
+        doc["wifiStatus"] = "Disconnected";
+        doc["ipAddress"] = "N/A";
     }
-    // preferences.end(); // Không cần end() nếu muốn giữ nó mở, nhưng nếu chỉ dùng ở đây thì có thể end()
-    // Tốt hơn là giữ Preferences mở trong suốt thời gian chạy của NetworkManager.
+
+    doc["mqttStatus"] = isMqttConnected() ? "Connected" : "Disconnected";
+    
+    if (_timeSync) {
+        doc["systemTime"] = _timeClient.getFormattedTime(); // Assumes NTPClient provides formatted time
+    } else {
+        doc["systemTime"] = "NTP not synced";
+    }
+
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["maxAllocHeap"] = ESP.getMaxAllocHeap();
+    doc["chipRevision"] = ESP.getChipRevision();
+    doc["cpuFreqMHz"] = ESP.getCpuFreqMHz();
+    // Add uptime if desired
+    // unsigned long uptimeMillis = millis();
+    // unsigned long uptimeSeconds = uptimeMillis / 1000;
+    // unsigned long uptimeMinutes = uptimeSeconds / 60;
+    // unsigned long uptimeHours = uptimeMinutes / 60;
+    // doc["uptime"] = String(uptimeHours) + "h " + String(uptimeMinutes % 60) + "m " + String(uptimeSeconds % 60) + "s";
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+    AppLogger.info("WebServer", "Sent system info.");
+}
+
+// Renamed from _loadCredentials and expanded
+bool NetworkManager::_loadNetworkConfig() {
+    // Load WiFi SSID
+    String nvs_ssid = _preferences.getString("wifi_ssid", "");
+    if (nvs_ssid.length() > 0) {
+        strncpy(_targetSsid, nvs_ssid.c_str(), sizeof(_targetSsid) -1);
+        _targetSsid[sizeof(_targetSsid)-1] = '\0';
+        AppLogger.info("NVM", "Loaded SSID from NVS: '" + String(_targetSsid) + "'");
+    } else {
+        _targetSsid[0] = '\0'; // Ensure it's empty if not in NVS
+        AppLogger.info("NVM", "No SSID found in NVS.");
+    }
+
+    // Load WiFi Password
+    String nvs_pass = _preferences.getString("wifi_pass", "");
+    // Password can be empty, so we always copy what's there (or empty string if key doesn't exist)
+    strncpy(_targetPassword, nvs_pass.c_str(), sizeof(_targetPassword) -1);
+    _targetPassword[sizeof(_targetPassword)-1] = '\0';
+    // AppLogger.info("NVM", "Loaded Password from NVS (length: " + String(nvs_pass.length()) + ")");
+
+
+    // Load MQTT Server
+    String nvs_mqtt_server = _preferences.getString("mqtt_server", DEFAULT_MQTT_SERVER);
+    strncpy(_mqttServer, nvs_mqtt_server.c_str(), sizeof(_mqttServer) -1);
+    _mqttServer[sizeof(_mqttServer)-1] = '\0';
+    AppLogger.info("NVM", "MQTT Server: '" + String(_mqttServer) + (nvs_mqtt_server == DEFAULT_MQTT_SERVER && !_preferences.isKey("mqtt_server") ? "' (Default)" : "' (From NVS)"));
+    
+    // Load MQTT Port
+    _mqttPort = _preferences.getInt("mqtt_port", DEFAULT_MQTT_PORT);
+    AppLogger.info("NVM", "MQTT Port: " + String(_mqttPort) + (!_preferences.isKey("mqtt_port") ? " (Default)" : " (From NVS)"));
+
+    // Load API Key
+    String nvs_api_key = _preferences.getString("api_key", DEFAULT_API_KEY);
+    strncpy(_apiKey, nvs_api_key.c_str(), sizeof(_apiKey) -1);
+    _apiKey[sizeof(_apiKey)-1] = '\0';
+    AppLogger.info("NVM", "API Key: '" + String(_apiKey) + (nvs_api_key == DEFAULT_API_KEY && !_preferences.isKey("api_key") ? "' (Default)" : "' (From NVS)"));
+
+    return nvs_ssid.length() > 0; // Return true if an SSID was actually loaded from NVS
+}
+
+// Renamed from _saveCredentials and expanded
+void NetworkManager::_saveNetworkConfig() {
+    AppLogger.info("NVM", "Attempting to save network configuration to NVS...");
+    bool success = true;
+
+    if (!_preferences.putString("wifi_ssid", _targetSsid)) {
+        AppLogger.error("NVM", "Failed to save SSID."); success = false;
+    }
+
+    // Attempt to remove the key first, in case it's corrupted
+    _preferences.remove("wifi_pass"); 
+    // We don't strictly need to check the return of remove() here for this attempt;
+    // if putString still fails, it will be logged.
+
+    if (!_preferences.putString("wifi_pass", _targetPassword)) {
+        AppLogger.error("NVM", "Failed to save WiFi Password."); success = false;
+    }
+    if (!_preferences.putString("mqtt_server", _mqttServer)) {
+        AppLogger.error("NVM", "Failed to save MQTT Server."); success = false;
+    }
+    if (!_preferences.putInt("mqtt_port", _mqttPort)) {
+        AppLogger.error("NVM", "Failed to save MQTT Port."); success = false;
+    }
+    if (!_preferences.putString("api_key", _apiKey)) {
+        AppLogger.error("NVM", "Failed to save API Key."); success = false;
+    }
+
+    if (success) {
+        AppLogger.info("NVM", "Network configuration saved to NVS successfully.");
+    } else {
+        AppLogger.error("NVM", "One or more network configuration items failed to save to NVS.");
+    }
+}
+
+String NetworkManager::getMqttServer() const {
+    return String(_mqttServer);
+}
+
+int NetworkManager::getMqttPort() const {
+    return _mqttPort;
+}
+
+String NetworkManager::getApiKey() const {
+    return String(_apiKey);
 }
 
 // ... (rest of NetworkManager.cpp) ... 

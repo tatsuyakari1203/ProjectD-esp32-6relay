@@ -61,9 +61,9 @@ const int numRelays = 6;
 // WiFi and MQTT configuration
 // const char* WIFI_SSID = "2.4 KariS";  // Sẽ không dùng trực tiếp nữa, NetworkManager sẽ xử lý
 // const char* WIFI_PASSWORD = "12123402";  // Sẽ không dùng trực tiếp nữa
-const char* MQTT_SERVER = "karis.cloud";
-const int MQTT_PORT = 1883;
-const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Provided API key
+// const char* MQTT_SERVER = "karis.cloud"; // Will be managed by NetworkManager
+// const int MQTT_PORT = 1883; // Will be managed by NetworkManager
+// const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Will be managed by NetworkManager
 
 // MQTT topic configuration
 const char* MQTT_TOPIC_SENSORS = "irrigation/esp32_6relay/sensors";
@@ -220,41 +220,30 @@ void Core0TaskCode(void * parameter) {
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
       lastSensorReadTime = currentTime;
       
-      // Take mutex before accessing sensor data
       if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
-        // --- NEW: Performance Logging Start ---
         unsigned long sensorReadStartTime = millis();
         bool readSuccess = false;
-        // --- END NEW ---
 
-        // Read data from sensors
         if (sensorManager.readSensors()) {
-          // Mark as success
           readSuccess = true;
-          
-          // Cập nhật ngay vào EnvironmentManager
           envManager.setCurrentTemperature(sensorManager.getTemperature());
           envManager.setCurrentHumidity(sensorManager.getHumidity());
           envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
           
-          // Log sensor data
           AppLogger.debug("Core0", "Sensors read: T=" + String(sensorManager.getTemperature()) +
                           "°C, H=" + String(sensorManager.getHumidity()) +
                           "%, HI=" + String(sensorManager.getHeatIndex()) + "°C");
           
-          // Send data to MQTT server immediately after reading
           if (networkManager.isConnected()) {
-            // Create JSON payload
-            String payload = sensorManager.getJsonPayload(API_KEY);
+            // Use API Key from NetworkManager
+            String apiKey = networkManager.getApiKey(); 
+            String payload = sensorManager.getJsonPayload(apiKey.c_str()); // Use retrieved API Key
             
-            // --- NEW: Performance Logging for MQTT Publish Start ---
             unsigned long mqttPublishStartTime = millis();
             bool mqttSuccess = networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
             unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
             AppLogger.perf("Core0", "MQTTSensorDataPublish", mqttPublishDuration, mqttSuccess);
-            // --- END NEW ---
             
-            // Existing log can be kept or removed since we now have the perf log
             AppLogger.debug("Core0", "Sensor data published to MQTT");
           } else {
             AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
@@ -266,10 +255,8 @@ void Core0TaskCode(void * parameter) {
           readSuccess = false;
         }
         
-        // --- NEW: Performance Logging End ---
         unsigned long sensorReadDuration = millis() - sensorReadStartTime;
         AppLogger.perf("Core0", "SensorReadOperation", sensorReadDuration, readSuccess);
-        // --- END NEW ---
         
         // Release mutex after accessing sensor data
         xSemaphoreGive(sensorDataMutex);
@@ -279,10 +266,10 @@ void Core0TaskCode(void * parameter) {
     // Publish relay and scheduler status khi có thay đổi hoặc cần gửi dự phòng
     if (networkManager.isConnected()) {
       bool forcedReport = (currentTime - lastForcedStatusReportTime >= forcedStatusReportInterval);
+      String apiKey = networkManager.getApiKey(); // Get API Key for status reports
       
-      // Publish relay status khi có thay đổi hoặc gửi dự phòng
       if (relayManager.hasStatusChangedAndReset() || forcedReport) {
-        String statusPayload = relayManager.getStatusJson(API_KEY);
+        String statusPayload = relayManager.getStatusJson(apiKey.c_str()); // Use retrieved API Key
         networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
         if (forcedReport) {
           AppLogger.debug("Core0", "Relay status published to MQTT (forced report)");
@@ -291,9 +278,12 @@ void Core0TaskCode(void * parameter) {
         }
       }
       
-      // Publish schedule status khi có thay đổi hoặc gửi dự phòng
       if (taskScheduler.hasScheduleStatusChangedAndReset() || forcedReport) {
-        String schedulePayload = taskScheduler.getTasksJson(API_KEY);
+        // Assuming getTasksJson also needs the API key, if not, this can be removed for this part.
+        // If it doesn't, then apiKey variable might not be needed in this specific scope if already declared above.
+        // For consistency, let's assume it might use it or could in the future.
+        String apiKeyForScheduler = networkManager.getApiKey(); // Get API Key
+        String schedulePayload = taskScheduler.getTasksJson(apiKeyForScheduler.c_str()); // Use retrieved API Key
         networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
         if (forcedReport) {
           AppLogger.debug("Core0", "Schedule status published to MQTT (forced report)");
@@ -432,15 +422,18 @@ void setup() {
   // Sau đó sử dụng các biến storedSsid, storedPassword,... khi gọi networkManager.begin()
 
   // Initialize NetworkManager FIRST
-  // Truyền "" cho SSID và Password ban đầu, NetworkManager sẽ xử lý việc đọc NVS (chưa làm) hoặc mở portal
-  // if (!networkManager.begin(storedSsid.c_str(), storedPassword.c_str(), MQTT_SERVER, MQTT_PORT)) { // Khi có NVS
-  if (!networkManager.begin("", "", MQTT_SERVER, MQTT_PORT)) { // Hiện tại, luôn truyền rỗng để test portal
-    // AppLogger.begin() has been moved before this, so it should be available.
+  // Pass empty strings for initial SSID/password to allow NVS loading or portal activation.
+  // MQTT server and port are no longer passed here; NetworkManager loads them.
+  if (!networkManager.begin("", "")) { 
     AppLogger.warning("Main", "NetworkManager did not connect to WiFi/MQTT. Config Portal might be active or system will retry.");
-    // LED sẽ được xử lý trong Core0Task dựa trên trạng thái NetworkManager
   } else {
     AppLogger.info("Main", "NetworkManager initialized and connected to WiFi/MQTT successfully.");
   }
+
+  // Now that NetworkManager has loaded its config (including MQTT server, port, API key from NVS or defaults),
+  // we can log them or use them. For example, if AppLogger needs the API key:
+  AppLogger.info("Main", "MQTT Server from NetMgr: " + networkManager.getMqttServer() + ":" + String(networkManager.getMqttPort()));
+  AppLogger.info("Main", "API Key from NetMgr: " + networkManager.getApiKey());
 
   AppLogger.info("Setup", "System setup sequence started.");
   AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");

@@ -65,7 +65,7 @@ private:
     NetworkManager* _networkManager; // Pointer to use NetworkManager for MQTT publishing
     LogLevel _serialLogLevel;        // Current log level for Serial
     LogLevel _mqttLogLevel;          // Current log level for MQTT
-    const char* _apiKey;             // API key for authentication
+    String _apiKey;                  // API key for authentication (Changed to String)
 
     const char* _mqttLogTopic = "irrigation/esp32_6relay/logs"; // MQTT topic for logs
 
