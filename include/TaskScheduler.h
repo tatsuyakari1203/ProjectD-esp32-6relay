@@ -79,6 +79,9 @@ public:
     // Cập nhật hệ thống
     void update();
     
+    // Lấy thời điểm sớm nhất cần kiểm tra lịch
+    time_t getEarliestNextCheckTime() const;
+    
 private:
     RelayManager& _relayManager;
     EnvironmentManager& _envManager;
@@ -86,6 +89,7 @@ private:
     std::vector<uint8_t> _activeZones;       // Các vùng đang hoạt động
     SemaphoreHandle_t _mutex;
     unsigned long _lastCheckTime;            // Thời điểm kiểm tra gần nhất
+    time_t _earliestNextCheckTime;           // Thời điểm sớm nhất cần kiểm tra lại lịch
     
     // Phương thức đơn giản
     void checkTasks();                       // Kiểm tra lịch đến giờ
@@ -97,6 +101,7 @@ private:
     bool checkSensorConditions(const IrrigationTask& task); // Kiểm tra điều kiện cảm biến
     uint8_t daysArrayToBitmap(JsonArray daysArray); // Chuyển mảng ngày sang bitmap
     JsonArray bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap); // Chuyển bitmap sang mảng ngày
+    void recomputeEarliestNextCheckTime();    // Tính toán lại thời điểm sớm nhất cần kiểm tra
     
     // Xử lý JSON
     void parseSensorCondition(JsonObject& jsonCondition, SensorCondition& condition);

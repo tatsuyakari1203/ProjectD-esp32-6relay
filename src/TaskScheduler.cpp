@@ -11,6 +11,7 @@ void TaskScheduler::begin() {
         // Khởi tạo danh sách lịch rỗng
         _tasks.clear();
         _activeZones.clear();
+        _earliestNextCheckTime = 0;
         
         Serial.println("TaskScheduler initialized");
         
@@ -44,6 +45,9 @@ bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task) {
             Serial.println("Added new irrigation task ID: " + String(task.id));
         }
         
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra
+        recomputeEarliestNextCheckTime();
+        
         xSemaphoreGive(_mutex);
         return true;
     }
@@ -64,6 +68,9 @@ bool TaskScheduler::deleteTask(int taskId) {
             
             // Xóa lịch
             _tasks.erase(it);
+            
+            // Tính toán lại thời điểm sớm nhất cần kiểm tra
+            recomputeEarliestNextCheckTime();
             
             Serial.println("Deleted irrigation task ID: " + String(taskId));
             xSemaphoreGive(_mutex);
@@ -307,6 +314,12 @@ bool TaskScheduler::processCommand(const char* json) {
         }
     }
     
+    // Nếu có bất kỳ thay đổi nào
+    if (anyChanges) {
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra
+        recomputeEarliestNextCheckTime();
+    }
+    
     return anyChanges;
 }
 
@@ -407,6 +420,14 @@ void TaskScheduler::update() {
         // Kiểm tra thời gian hiện tại
         time_t now;
         time(&now);
+        
+        // Kiểm tra nếu chưa đến thời điểm sớm nhất cần kiểm tra
+        if (_earliestNextCheckTime != 0 && now < _earliestNextCheckTime) {
+            // Chưa đến thời điểm cần kiểm tra, thoát sớm
+            xSemaphoreGive(_mutex);
+            return;
+        }
+        
         struct tm timeinfo;
         localtime_r(&now, &timeinfo);
         
@@ -492,6 +513,9 @@ void TaskScheduler::update() {
                 }
             }
         }
+        
+        // Tính toán lại thời điểm sớm nhất cần kiểm tra sau khi cập nhật
+        recomputeEarliestNextCheckTime();
         
         xSemaphoreGive(_mutex);
     }
@@ -691,4 +715,33 @@ JsonArray TaskScheduler::bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap
     }
     
     return array;
+}
+
+// Lấy thời điểm sớm nhất cần kiểm tra lịch
+time_t TaskScheduler::getEarliestNextCheckTime() const {
+    // Không cần mutex cho đọc đơn giản từ Core0
+    return _earliestNextCheckTime;
+}
+
+// Tính toán lại thời điểm sớm nhất cần kiểm tra lịch
+void TaskScheduler::recomputeEarliestNextCheckTime() {
+    _earliestNextCheckTime = 0; // Reset
+    time_t now_val;
+    time(&now_val);
+
+    for (const auto& task : _tasks) {
+        if (task.active && task.next_run > now_val) {
+            if (_earliestNextCheckTime == 0 || task.next_run < _earliestNextCheckTime) {
+                _earliestNextCheckTime = task.next_run;
+            }
+        }
+    }
+    
+    if (_earliestNextCheckTime == 0 && !_tasks.empty()) {
+        // Nếu có task nhưng tất cả đã qua hoặc không active
+        _earliestNextCheckTime = now_val + 60; // Kiểm tra lại sau 1 phút như một fallback
+    } else if (_tasks.empty()) {
+        // Nếu không có task nào, kiểm tra lại sau 5 phút
+        _earliestNextCheckTime = now_val + 300;
+    }
 } 

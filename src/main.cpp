@@ -70,8 +70,6 @@ unsigned long lastSensorReadTime = 0;
 const unsigned long sensorReadInterval = 5000;  // Read sensors and send data every 5 seconds
 unsigned long lastStatusReportTime = 0;
 const unsigned long statusReportInterval = 10000;  // Send status every 10 seconds
-unsigned long lastScheduleCheckTime = 0;
-const unsigned long scheduleCheckInterval = 1000;  // Check schedule every 1 second
 unsigned long lastEnvUpdateTime = 0;
 const unsigned long envUpdateInterval = 2000;  // Update environment readings every 2 seconds
 
@@ -237,9 +235,14 @@ void Core0TaskCode(void * parameter) {
       }
     }
     
-    // Check and update irrigation schedules
-    if (currentTime - lastScheduleCheckTime >= scheduleCheckInterval) {
-      lastScheduleCheckTime = currentTime;
+    // Check and update irrigation schedules - Event-driven approach
+    time_t current_time_for_scheduler;
+    time(&current_time_for_scheduler);
+    time_t next_check = taskScheduler.getEarliestNextCheckTime();
+    
+    if (next_check == 0 || current_time_for_scheduler >= next_check) {
+      // Nếu next_check là 0 (chưa có lịch, hoặc cần tính toán lại lần đầu)
+      // hoặc đã đến/qua thời điểm kiểm tra
       taskScheduler.update();
     }
     
