@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 WiFi Config</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div id="login-section">
+            <h2>Login</h2>
+            <input type="password" id="adminPassword" placeholder="Enter Admin Password">
+            <button id="loginButton">Login</button>
+            <p id="login-status" class="status-message"></p>
+        </div>
+
+        <div id="config-section" style="display:none;">
+            <h2>WiFi Configuration</h2>
+            <div class="form-group">
+                <label for="ssid">SSID (Tên WiFi):</label>
+                <input type="text" id="ssid" name="ssid" placeholder="Nhập tên WiFi">
+                <!-- Removed Scan Button and WiFi List Display Area -->
+            </div>
+            <div class="form-group">
+                <label for="pass">Password (Mật khẩu WiFi):</label>
+                <input type="password" id="pass" name="pass" placeholder="Nhập mật khẩu (để trống nếu không có)">
+            </div>
+            <button id="saveButton">Save & Connect</button>
+            <p id="status" class="status-message"></p>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html> 

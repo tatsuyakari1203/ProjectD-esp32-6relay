@@ -8,6 +8,7 @@
 #include "../include/Logger.h"
 #include <time.h>
 #include <Preferences.h>
+#include <nvs_flash.h>
 
 // THÊM VÀO: Hằng số cho JSON keys
 static const char* JSON_KEY_SOIL_MOISTURE = "soil_moisture";
@@ -58,8 +59,8 @@ const int relayPins[] = {
 const int numRelays = 6;
 
 // WiFi and MQTT configuration
-const char* WIFI_SSID = "2.4 KariS";  // Replace with your WiFi name
-const char* WIFI_PASSWORD = "12123402";  // Replace with your WiFi password
+// const char* WIFI_SSID = "2.4 KariS";  // Sẽ không dùng trực tiếp nữa, NetworkManager sẽ xử lý
+// const char* WIFI_PASSWORD = "12123402";  // Sẽ không dùng trực tiếp nữa
 const char* MQTT_SERVER = "karis.cloud";
 const int MQTT_PORT = 1883;
 const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Provided API key
@@ -323,7 +324,14 @@ void Core0TaskCode(void * parameter) {
       lastLedBlinkTime = currentTime;
       ledState = !ledState; // Toggle state for blinking effect
 
-      if (networkManager.isConnected()) {
+      if (networkManager.isConfigPortalActive()) { // Ưu tiên hiển thị trạng thái Portal
+        // Blink Purple LED when Config Portal is active
+        if (ledState) {
+          RGB_Light(50, 0, 50);  // Low brightness purple (điều chỉnh màu nếu cần)
+        } else {
+          RGB_Light(0, 0, 0);
+        }
+      } else if (networkManager.isConnected()) {
         // Blink green LED when connected
         if (ledState) {
           RGB_Light(0, 20, 0);  // Low brightness green
@@ -386,6 +394,33 @@ void setup() {
   }
   Serial.println(F("\n\nMain: Serial port initialized.")); // F() to save RAM
 
+  // --- NEW: Explicit NVS Initialization ---
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    Serial.println("NVS: Initialization failed (no free pages or new version), attempting to erase NVS partition...");
+    if (nvs_flash_erase() != ESP_OK) {
+        Serial.println("NVS: Failed to erase NVS partition.");
+    } else {
+        Serial.println("NVS: Erased NVS partition successfully.");
+    }
+    // Try to init NVS again after erase
+    ret = nvs_flash_init();
+  }
+  
+  if (ret != ESP_OK) {
+    Serial.printf("NVS: Failed to initialize NVS! Error: %s. System may not function correctly with NVS features.\n", esp_err_to_name(ret));
+    // Depending on the severity, you might halt or set a flag
+  } else {
+    Serial.println("NVS: Successfully initialized.");
+  }
+  // --- END NEW ---
+
+  // Initialize Logger 
+  // AppLogger.begin() MUST be called before any AppLogger calls in NetworkManager's constructor or begin method.
+  // Since NetworkManager's constructor doesn't use AppLogger anymore, and its begin() method does, 
+  // placing AppLogger.begin() here is fine.
+  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO); 
+
   // THÊM VÀO: Khởi tạo và đọc cấu hình từ NVS (ví dụ)
   // preferences.begin("app-config", false); // false = read/write, true = read-only
   // String storedSsid = preferences.getString("wifi_ssid", WIFI_SSID);
@@ -397,18 +432,16 @@ void setup() {
   // Sau đó sử dụng các biến storedSsid, storedPassword,... khi gọi networkManager.begin()
 
   // Initialize NetworkManager FIRST
-  // Nó sẽ cố gắng kết nối WiFi và MQTT. Nếu thất bại, nó sẽ tự động thử lại trong NetworkManager::loop()
-  if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
-    AppLogger.error("Setup", "NetworkManager failed to initialize properly. Check logs. System will attempt to reconnect.");
+  // Truyền "" cho SSID và Password ban đầu, NetworkManager sẽ xử lý việc đọc NVS (chưa làm) hoặc mở portal
+  // if (!networkManager.begin(storedSsid.c_str(), storedPassword.c_str(), MQTT_SERVER, MQTT_PORT)) { // Khi có NVS
+  if (!networkManager.begin("", "", MQTT_SERVER, MQTT_PORT)) { // Hiện tại, luôn truyền rỗng để test portal
+    // AppLogger.begin() has been moved before this, so it should be available.
+    AppLogger.warning("Main", "NetworkManager did not connect to WiFi/MQTT. Config Portal might be active or system will retry.");
     // LED sẽ được xử lý trong Core0Task dựa trên trạng thái NetworkManager
   } else {
-    AppLogger.info("Setup", "NetworkManager initialized. Attempting to connect...");
+    AppLogger.info("Main", "NetworkManager initialized and connected to WiFi/MQTT successfully.");
   }
 
-  // Initialize Logger AFTER NetworkManager has been initialized (hoặc ít nhất là cố gắng)
-  // AppLogger có thể cần NetworkManager để gửi log MQTT.
-  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
-  
   AppLogger.info("Setup", "System setup sequence started.");
   AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");
 

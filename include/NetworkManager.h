@@ -8,19 +8,41 @@
 #include <WiFiUdp.h>
 #include <vector> // For storing subscription topics
 
+// THÊM VÀO: Include cho AsyncWebServer và SPIFFS
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
+// #include <ArduinoJson.h> // Removing as it seems unused by NetworkManager now
+#include <Preferences.h> // THÊM VÀO: Thư viện Preferences cho NVS
+
+// For FreeRTOS task and semaphores - SẼ BỊ XÓA NẾU KHÔNG CÒN CẦN
+// #include <freertos/FreeRTOS.h> 
+// #include <freertos/task.h>
+// #include <freertos/semphr.h>
+
 typedef void (*MqttCallback)(char* topic, byte* payload, unsigned int length);
 
 // Configuration for retry mechanisms
-const uint8_t MAX_WIFI_RETRY_ATTEMPTS = 10;
+const uint8_t MAX_WIFI_RETRY_ATTEMPTS = 10; // Sẽ điều chỉnh lại khi có config portal
 const uint8_t MAX_MQTT_RETRY_ATTEMPTS = 10;
 const unsigned long INITIAL_RETRY_INTERVAL_MS = 5000;     // 5 seconds
 const unsigned long MAX_RETRY_INTERVAL_MS = 60000;        // 1 minute
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;      // 15 seconds for WiFi.begin()
 
+// THÊM VÀO: Hằng số cho AP Mode và WebServer
+// const char* AP_SSID = "ESP32-Config"; // Sẽ định nghĩa trong .cpp
+// const char* AP_PASSWORD = "password123"; // Sẽ định nghĩa trong .cpp
+// const int WEB_SERVER_PORT = 80; // Sẽ định nghĩa trong .cpp
+// const char* ADMIN_LOGIN_PASSWORD = "admin123"; // Sẽ định nghĩa trong .cpp
+
+extern const char* AP_SSID;
+extern const char* AP_PASSWORD;
+extern const int WEB_SERVER_PORT; 
+extern const char* ADMIN_LOGIN_PASSWORD;
+
 class NetworkManager {
 public:
     NetworkManager();
-    bool begin(const char* ssid, const char* password, const char* mqttServer, int mqttPort);
+    bool begin(const char* initial_ssid, const char* initial_password, const char* mqttServer, int mqttPort);
     // void addSubscriptionTopic(const char* topic); // Suggestion for more flexible topic management
     bool publish(const char* topic, const char* payload);
     bool subscribe(const char* topic); // Will add to list and attempt to subscribe if connected
@@ -37,14 +59,21 @@ public:
     bool isAttemptingMqttReconnect() const;
     int getMqttState();
     
+    // THÊM VÀO: Phương thức cho Config Portal
+    void startConfigPortal();
+    void stopConfigPortal();
+    bool isConfigPortalActive() const;
+    IPAddress getLocalIP() const; // Để lấy IP khi đã kết nối WiFi
+    IPAddress getSoftAPIP() const; // Để lấy IP của AP
+
 private:
     WiFiClient _wifiClient;
     PubSubClient _mqttClient;
     WiFiUDP _ntpUDP;
     NTPClient _timeClient;
     
-    char _ssid[64];
-    char _password[64];
+    char _targetSsid[64]; // SSID mục tiêu (từ NVS hoặc config portal)
+    char _targetPassword[64]; // Password mục tiêu
     char _mqttServer[64];
     int _mqttPort;
     char _clientId[32];
@@ -67,13 +96,40 @@ private:
 
     std::vector<String> _subscriptionTopics; // Store topics to subscribe/resubscribe
 
+    // THÊM VÀO: AsyncWebServer object
+    AsyncWebServer _server;
+    bool _configPortalActive;
+
+    // THÊM VÀO: Đối tượng Preferences
+    Preferences _preferences;
+
     // Private helper methods
-    bool _connectWifi();
+    bool _connectWifi(const char* ssid, const char* password); // Sửa đổi để nhận ssid/pass
     bool _connectMqtt(); // Renamed from reconnect for clarity
     void _executeMqttSubscriptions();
     void _handleWifiDisconnect();
     void _handleMqttDisconnect();
 
+    // THÊM VÀO: Web server request handlers
+    void _handleRoot(AsyncWebServerRequest *request);
+    void _handleSave(AsyncWebServerRequest *request);
+    // void _handleScanWifi(AsyncWebServerRequest *request); // XÓA BỎ
+    void _handleNotFound(AsyncWebServerRequest *request);
+    void _serveStaticFile(AsyncWebServerRequest *request, const char* path, const char* contentType);
+
+    // THÊM VÀO: Preferences/NVS helper
+    bool _loadCredentials(String& ssid, String& password); 
+    void _saveCredentials(const char* ssid, const char* password);
+
+    // --- XÓA BỎ PHẦN For asynchronous WiFi Scan ---
+    // static void _wifiScanTaskRunner(void* pvParameters); 
+    // void _performActualWifiScan();                      
+    // TaskHandle_t _wifiScanTaskHandle;          
+    // SemaphoreHandle_t _scanRequestSemaphore;    
+    // SemaphoreHandle_t _scanResultReadySemaphore; 
+    // String _lastScanResultsJson;                
+    // volatile bool _isScanInProgressFlag;        
+    // --- KẾT THÚC PHẦN XÓA BỎ ---
 };
 
 #endif // NETWORK_MANAGER_H 
