@@ -1,754 +1,380 @@
-    # Hướng Dẫn Triển Khai Relay Hướng Sự Kiện (Event-Driven) cho ESP32
+## Hướng Dẫn Chi Tiết Tối Ưu Hóa Hiệu Suất Hệ Thống ESP32-S3 6-Relay
 
-    Tài liệu này mô tả các bước chi tiết để chuyển đổi `RelayManager` và `Core1TaskCode` trong dự án ESP32 của bạn sang kiến trúc hướng sự kiện, sử dụng FreeRTOS Software Timers và Queues. Mục tiêu là tối ưu hóa hệ thống, giảm độ trễ và sử dụng tài nguyên hiệu quả hơn.
+## Dưới đây là phân tích và hướng dẫn chi tiết cho từng giải pháp tối ưu, giúp hệ thống xử lý hiệu quả các lệnh điều khiển dày đặc.
 
-    ## Mục Lục
+### 1. Tối ưu hóa `RelayManager::processCommand` (Phân tích JSON)
 
-    1.  [Tổng Quan về Thay Đổi](#tổng-quan-về-thay-đổi)
-    2.  [Cập Nhật `RelayManager.h`](#cập-nhật-relaymanagerh)
-    3.  [Cập Nhật `RelayManager.cpp`](#cập-nhật-relaymanagercpp)
-    4.  [Cập Nhật `main.cpp`](#cập-nhật-maincpp)
-    5.  [Giải Thích Luồng Hoạt Động Mới](#giải-thích-luồng-hoạt-động-mới)
-    6.  [Các Bước Tiếp Theo và Lưu Ý](#các-bước-tiếp-theo-và-lưu-ý)
+****Vấn đề:**** `DynamicJsonDocument` thực hiện cấp phát bộ nhớ động, có thể gây phân mảnh heap và tốn thời gian xử lý khi nhận lệnh liên tục.****Giải pháp chi tiết:***** ****Sử dụng `StaticJsonDocument` nếu cấu trúc lệnh ổn định:****
 
-    ## 1. Tổng Quan về Thay Đổi
+  - ****Xác định kích thước tối đa:**** Phân tích cấu trúc JSON lệnh điều khiển relay (`irrigation/esp32_6relay/control`) để xác định kích thước tối đa cần thiết. Ví dụ, nếu một lệnh có thể điều khiển tối đa 6 relay, và mỗi relay object chiếm khoảng 50-70 byte, cộng thêm các trường `api_key` và mảng `relays`, kích thước có thể ước tính.
 
-    Thay vì `Core1TaskCode` liên tục kiểm tra (polling) trạng thái của các relay timer, chúng ta sẽ sử dụng các cơ chế sau:
+    - Ví dụ tính toán:
 
-    * **FreeRTOS Software Timers:** Mỗi khi một relay được bật với một khoảng thời gian (`duration`), một software timer sẽ được kích hoạt. Khi timer này hết hạn, nó sẽ gọi một hàm callback.
-    * **FreeRTOS Queues:** Hàm callback của software timer sẽ gửi một "sự kiện" (chứa thông tin về relay đã hết hạn timer) vào một hàng đợi (queue).
-    * **`Core1TaskCode` (Đã sửa đổi):** Task này sẽ "chờ" (block) trên hàng đợi đó. Khi có sự kiện mới, task sẽ được đánh thức, nhận sự kiện và thực hiện hành động tắt relay tương ứng.
+      - `api_key`: \~50 byte
 
-    Điều này giúp `Core1TaskCode` không cần phải chạy liên tục, tiết kiệm CPU và phản ứng nhanh hơn khi timer thực sự hết hạn.
+      - `relays`: \[] (khung mảng) \~4 byte
 
-    ## 2. Cập Nhật `RelayManager.h`
+      - Mỗi relay object: `{"id":X,"state":true,"duration":YYYYY}` \~ 40-50 byte. Với 6 relay: 6 \* 50 = 300 byte.
 
-    Tệp header cho `RelayManager` cần được sửa đổi để bao gồm các thành phần của FreeRTOS và thay đổi cách lưu trữ trạng thái relay.
+      - Tổng cộng: 50 + 4 + 300 = 354 byte. Chọn kích thước `StaticJsonDocument` lớn hơn một chút, ví dụ 512 hoặc 768 để có khoảng đệm.
 
-    ```cpp
-    #ifndef RELAY_MANAGER_H
-    #define RELAY_MANAGER_H
+  - ****Triển khai:****
 
-    #include <Arduino.h>
-    #include <ArduinoJson.h>
-    #include "freertos/FreeRTOS.h" // Thêm thư viện FreeRTOS
-    #include "freertos/timers.h"   // Thêm thư viện Software Timers
-    #include "freertos/queue.h"    // Thêm thư viện Queues
+        // Trong RelayManager.cpp, hàm processCommand
+        // bool RelayManager::processCommand(const char* json) {
+            // ... (các phần khác của hàm) ...
+            // Thay vì DynamicJsonDocument doc(512);
+            StaticJsonDocument<512> doc; // Sử dụng kích thước đã tính toán
+            DeserializationError error = deserializeJson(doc, json);
 
-    // Định nghĩa kiểu dữ liệu cho sự kiện relay timer
-    typedef struct {
-        int relayIndex;
-    } RelayTimerEvent_t;
-
-
-    // Struct để lưu trạng thái relay
-    struct RelayStatus {
-        bool state;                  // Trạng thái hiện tại (true = bật, false = tắt)
-        // unsigned long endTime;    // Sẽ được quản lý bởi software timer, không cần endTime nữa
-        TimerHandle_t timerHandle;   // Handle cho software timer của relay này
-    };
-
-    class RelayManager {
-    public:
-        RelayManager();
-        
-        // Khởi tạo relays và queue
-        // Cần truyền vào queue handle từ bên ngoài hoặc tạo trong begin() và có getter
-        void begin(const int* relayPins, int numRelays, QueueHandle_t relayEventQueue);
-        
-        // Điều khiển relay
-        void setRelay(int relayIndex, bool state, unsigned long duration = 0);
-        
-        // Bật relay
-        void turnOn(int relayIndex, unsigned long duration = 0);
-        
-        // Tắt relay
-        void turnOff(int relayIndex);
-        
-        // Lấy trạng thái relay
-        bool getState(int relayIndex);
-        
-        // Lấy thời gian còn lại (sẽ phức tạp hơn với software timer, có thể cần API của FreeRTOS timer)
-        // unsigned long getRemainingTime(int relayIndex); // Cân nhắc loại bỏ hoặc triển khai lại
-        
-        // Xử lý các relay có timer - Sẽ được thay thế bằng logic trong Core1TaskCode dựa trên queue
-        // void update(); // Hàm này có thể không cần thiết nữa cho việc quản lý timer
-        
-        // Tạo payload JSON cho trạng thái relay
-        String getStatusJson(const char* apiKey);
-        
-        // Xử lý JSON lệnh điều khiển
-        bool processCommand(const char* json);
-        
-        // Kiểm tra xem trạng thái có thay đổi không và reset cờ
-        bool hasStatusChangedAndReset();
-
-        // Hàm callback cho software timer (phải là static hoặc global nếu không dùng mẹo)
-        static void relayTimerCallback(TimerHandle_t xTimer);
-        
-    private:
-        const int* _relayPins;        // Con trỏ đến mảng chân GPIO relay
-        int _numRelays;               // Số lượng relay
-        RelayStatus* _relayStatus;    // Mảng trạng thái relay (giờ chứa cả timer handle)
-        SemaphoreHandle_t _mutex;     // Mutex để bảo vệ truy cập _relayStatus và _statusChanged
-        bool _statusChanged;          // Cờ đánh dấu thay đổi trạng thái
-
-        QueueHandle_t _relayEventQueue; // Hàng đợi để nhận sự kiện từ timer callbacks
-        // Để relayTimerCallback truy cập _relayEventQueue và _instance của RelayManager
-        // chúng ta cần một cách. Một cách đơn giản là làm cho _relayEventQueue là static
-        // hoặc truyền con trỏ RelayManager vào Timer ID, nhưng an toàn hơn là queue được truyền từ bên ngoài.
-        // Hoặc có thể dùng một con trỏ static tới instance của RelayManager (Singleton pattern - không khuyến khích nếu có thể tránh)
-        // Trong ví dụ này, _relayEventQueue sẽ được truyền vào từ bên ngoài.
-    };
-
-    #endif // RELAY_MANAGER_H
-
-**Các thay đổi chính trong `RelayManager.h`:**
-
-- Bao gồm các header của FreeRTOS: `FreeRTOS.h`, `timers.h`, `queue.h`.
-
-- Định nghĩa `RelayTimerEvent_t` để chứa thông tin sự kiện (chỉ số relay).
-
-- Trong `RelayStatus`, loại bỏ `endTime` và thêm `TimerHandle_t timerHandle`.
-
-- Hàm `begin` nhận thêm tham số `QueueHandle_t relayEventQueue`.
-
-- Hàm `update()` có thể không cần thiết nữa cho việc quản lý timer.
-
-- Khai báo `static void relayTimerCallback(TimerHandle_t xTimer)` cho software timer.
-
-- Thêm `QueueHandle_t _relayEventQueue` làm thành viên private.
-
-
-## 3. Cập Nhật `RelayManager.cpp`
-
-Tệp triển khai cho `RelayManager` sẽ chứa logic chính của việc tạo, quản lý software timers và gửi sự kiện vào queue.
-
-    #include "../include/RelayManager.h"
-    #include "../include/Logger.h" // Đảm bảo Logger được include
-    #include <time.h>
-
-    // Khai báo extern cho queue toàn cục (sẽ được định nghĩa trong main.cpp)
-    // Đây là một cách đơn giản hóa để hàm static callback có thể truy cập queue.
-    // Một giải pháp tốt hơn trong C++ có thể là sử dụng con trỏ thành viên hoặc lambda nếu RTOS hỗ trợ.
-    extern QueueHandle_t g_relayEventQueue; 
-
-    // Khởi tạo RelayManager
-    RelayManager::RelayManager() {
-        _relayPins = nullptr;
-        _numRelays = 0;
-        _relayStatus = nullptr;
-        _mutex = xSemaphoreCreateMutex(); 
-        _statusChanged = false;
-        _relayEventQueue = NULL; 
-    }
-
-    // Hàm callback cho software timer (static)
-    void RelayManager::relayTimerCallback(TimerHandle_t xTimer) {
-        // Lấy relayIndex từ ID của timer. ID này được set khi tạo timer.
-        int relayIndex = (int)pvTimerGetTimerID(xTimer);
-        AppLogger.debug("RelayTimerCb", "Timer expired cho relay index: " + String(relayIndex));
-
-        RelayTimerEvent_t event;
-        event.relayIndex = relayIndex;
-
-        // Gửi sự kiện vào queue toàn cục g_relayEventQueue
-        if (g_relayEventQueue != NULL) {
-            if (xQueueSend(g_relayEventQueue, &event, (TickType_t)0) != pdPASS) {
-                AppLogger.error("RelayTimerCb", "Không thể gửi sự kiện vào relay queue cho relay " + String(relayIndex));
-            } else {
-                AppLogger.debug("RelayTimerCb", "Đã gửi sự kiện hết hạn timer cho relay " + String(relayIndex) + " vào queue.");
+            if (error) {
+                AppLogger.error("RelayMgr", "Phân tích JSON thất bại (Static): " + String(error.c_str()));
+                // ... (xử lý lỗi) ...
+                return false;
             }
-        } else {
-            AppLogger.error("RelayTimerCb", "Relay event queue (g_relayEventQueue) chưa được khởi tạo!");
-        }
-    }
+            // ... (phần còn lại của hàm giữ nguyên) ...
+        // }
 
-    // Khởi tạo RelayManager
-    void RelayManager::begin(const int* relayPins, int numRelays, QueueHandle_t relayEventQueue) {
-        _relayPins = relayPins;
-        _numRelays = numRelays;
-        // Lưu ý: _relayEventQueue của instance này có thể không cần thiết nếu callback dùng g_relayEventQueue
-        // Tuy nhiên, để nhất quán, chúng ta vẫn gán nó.
-        _relayEventQueue = relayEventQueue; 
+  - ****Ưu điểm:**** Loại bỏ cấp phát động, giảm phân mảnh heap, tăng tốc độ phân tích.
 
-        _relayStatus = new RelayStatus[numRelays];
-        
-        for (int i = 0; i < _numRelays; i++) {
-            pinMode(_relayPins[i], OUTPUT);
-            digitalWrite(_relayPins[i], LOW); 
-            _relayStatus[i].state = false;
+  - ****Nhược điểm:**** Nếu kích thước payload thực tế vượt quá kích thước khai báo của `StaticJsonDocument`, việc phân tích sẽ thất bại. Cần tính toán kích thước cẩn thận.
 
-            char timerName[20];
-            sprintf(timerName, "RelayTimer%d", i);
+* ****Zero-Copy Deserialization (Nâng cao):****
 
-            _relayStatus[i].timerHandle = xTimerCreate(timerName, 
-                                                       pdMS_TO_TICKS(1000), 
-                                                       pdFALSE,             
-                                                       (void*)i,            // Timer ID là relayIndex
-                                                       RelayManager::relayTimerCallback); 
-            
-            if (_relayStatus[i].timerHandle == NULL) {
-                AppLogger.error("RelayMgr", "Không thể tạo timer cho relay " + String(i + 1));
-            } else {
-                AppLogger.debug("RelayMgr", "Đã tạo timer cho relay " + String(i+1) + " với ID: " + String(i));
-            }
-        }
-        
-        _statusChanged = true; 
-        AppLogger.info("RelayMgr", "Đã khởi tạo " + String(_numRelays) + " relays với software timers.");
-    }
+  - Nếu bộ nhớ cực kỳ eo hẹp và tốc độ là tối quan trọng, bạn có thể xem xét việc phân tích JSON thủ công hoặc sử dụng các thư viện JSON "zero-copy" (ít phổ biến hơn trong Arduino). Tuy nhiên, điều này làm tăng đáng kể độ phức tạp của mã. Đối với hầu hết các trường hợp, `StaticJsonDocument` là một cải tiến đủ tốt.
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-    // Đặt trạng thái relay
-    void RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) {
-        if (relayIndex < 0 || relayIndex >= _numRelays) {
-            AppLogger.error("RelayMgr", "Lỗi: Chỉ số relay không hợp lệ: " + String(relayIndex));
-            return;
-        }
-        
-        if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-            bool previousState = _relayStatus[relayIndex].state;
-            
-            if (state) { // Bật relay
-                digitalWrite(_relayPins[relayIndex], HIGH);
-                _relayStatus[relayIndex].state = true;
-                
-                if (duration > 0) {
-                    AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " BẬT trong " + String(duration / 1000) + " giây.");
-                    if (_relayStatus[relayIndex].timerHandle != NULL) {
-                        if (xTimerChangePeriod(_relayStatus[relayIndex].timerHandle, pdMS_TO_TICKS(duration), (TickType_t)0) != pdPASS) {
-                            AppLogger.error("RelayMgr", "Không thể thay đổi chu kỳ timer cho relay " + String(relayIndex + 1));
-                        }
-                        if (xTimerStart(_relayStatus[relayIndex].timerHandle, (TickType_t)0) != pdPASS) {
-                            AppLogger.error("RelayMgr", "Không thể khởi động timer cho relay " + String(relayIndex + 1));
-                        }
-                    }
-                } else {
-                    AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " BẬT vô thời hạn.");
-                    if (_relayStatus[relayIndex].timerHandle != NULL && xTimerIsTimerActive(_relayStatus[relayIndex].timerHandle)) {
-                        xTimerStop(_relayStatus[relayIndex].timerHandle, (TickType_t)0);
-                    }
+### 2. Giảm Thời Gian Khóa Mutex và Tranh Chấp
+
+****Vấn đề:**** `_mutex` trong `RelayManager` bảo vệ `_relayStatus` và `_statusChanged`. Nếu các hàm giữ mutex quá lâu hoặc được gọi quá thường xuyên từ nhiều ngữ cảnh, có thể xảy ra tranh chấp.****Giải pháp chi tiết:***** ****Giữ thời gian khóa mutex ở mức tối thiểu:****
+
+  - Trong `setRelay`: Các thao tác chính là `digitalWrite`, thay đổi trạng thái trong `_relayStatus`, và quản lý timer. Các thao tác này tương đối nhanh.
+
+  - Trong `getStatusJson`: Việc duyệt qua `_numRelays` (tối đa 6) và tạo JSON cũng nhanh.
+
+  - ****Kiểm tra lại `anyChangeMadeByThisCommand` trong `processCommand`:**** Logic hiện tại để xác định `anyChangeMadeByThisCommand` có một vài lần lấy và thả mutex (`xSemaphoreTake(_mutex, pdMS_TO_TICKS(10))`). Mặc dù timeout ngắn, việc này có thể được tối ưu.
+
+    - ****Tối ưu hóa kiểm tra thay đổi:**** Thay vì kiểm tra `_statusChanged` toàn cục nhiều lần, hãy để `setRelay` trả về một boolean cho biết nó có thực sự thay đổi trạng thái của relay cụ thể đó hay không.
+
+          // Trong RelayManager.h:
+          // bool setRelay(int relayIndex, bool state, unsigned long duration = 0); // Thay đổi kiểu trả về
+
+          // Trong RelayManager.cpp:
+          // bool RelayManager::setRelay(int relayIndex, bool state, unsigned long duration) {
+          //     // ... (code hiện tại) ...
+          //     bool stateActuallyChanged = false; // Cờ cục bộ
+          //     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+          //         bool previousState = _relayStatus[relayIndex].state;
+          //         // ... (logic bật/tắt relay và timer) ...
+          //
+          //         if (previousState != _relayStatus[relayIndex].state /* || các điều kiện khác như duration thay đổi */) {
+          //             _statusChanged = true; // Cờ toàn cục vẫn cần thiết cho Core0Task
+          //             stateActuallyChanged = true; // Cờ cục bộ cho processCommand
+          //         }
+          //         xSemaphoreGive(_mutex);
+          //     }
+          //     return stateActuallyChanged;
+          // }
+
+          // Trong RelayManager::processCommand:
+          // for (JsonObject relayCmd : relaysArray) {
+          //     // ...
+          //     if (id >= 1 && id <= _numRelays) {
+          //         int relayIndex = id - 1;
+          //         if (setRelay(relayIndex, stateCmd, durationCmd)) { // Sử dụng giá trị trả về
+          //             anyChangeMadeByThisCommand = true;
+          //         }
+          //     }
+          //     // ...
+          // }
+
+    Điều này giúp `processCommand` không cần lấy mutex nhiều lần để kiểm tra `_statusChanged`.
+
+* ****Không thực hiện các thao tác tốn thời gian (ví dụ: logging nặng, ghi file) bên trong critical section (khu vực được bảo vệ bởi mutex).**** Logic hiện tại tuân thủ điều này.
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+### 3. Quản Lý Cập Nhật Trạng Thái MQTT (Debouncing/Throttling)
+
+****Vấn đề:**** Mỗi khi `_statusChanged` là `true`, `Core0TaskCode` sẽ gửi toàn bộ trạng thái relay lên MQTT. Với các lệnh dày đặc, điều này có thể tạo ra một "bão" tin nhắn MQTT.****Giải pháp chi tiết:***** ****Debouncing cập nhật trạng thái:****
+
+  - ****Ý tưởng:**** Khi một thay đổi trạng thái xảy ra, thay vì gửi ngay lập tức, hãy bắt đầu một bộ đếm thời gian ngắn (ví dụ: 500ms). Nếu có thêm thay đổi xảy ra trong khoảng thời gian này, hãy đặt lại bộ đếm. Chỉ gửi cập nhật MQTT khi bộ đếm hết hạn mà không có thay đổi mới.
+
+  - ****Triển khai trong `Core0TaskCode`:****
+
+    1. Thêm biến toàn cục (hoặc thành viên của một class quản lý trạng thái):
+
+           // Trong main.cpp
+           unsigned long lastRelayChangeTime = 0;
+           const unsigned long RELAY_STATUS_DEBOUNCE_MS = 500;
+           bool pendingRelayStatusUpdate = false;
+
+    2. Sửa đổi logic trong `Core0TaskCode`:
+
+           // Trong Core0TaskCode:
+           // if (relayManager.hasStatusChangedAndReset() || forcedReport) { // Logic cũ
+           //   // Gửi MQTT ngay
+           // }
+
+           // Logic mới:
+           if (relayManager.hasStatusChangedAndReset()) {
+               AppLogger.debug("Core0", "Relay status changed, scheduling debounced update.");
+               pendingRelayStatusUpdate = true;
+               lastRelayChangeTime = millis();
+           }
+
+           if (pendingRelayStatusUpdate && (millis() - lastRelayChangeTime >= RELAY_STATUS_DEBOUNCE_MS)) {
+               AppLogger.info("Core0", "Debounce time elapsed, publishing relay status.");
+               String statusPayload = relayManager.getStatusJson(API_KEY);
+               // ... (publish MQTT như cũ) ...
+               pendingRelayStatusUpdate = false; // Reset cờ
+               // Cập nhật lastForcedStatusReportTime nếu đây là một phần của forced report logic
+           }
+
+           // Xử lý forcedReport riêng biệt hoặc kết hợp:
+           if (forcedReport && !pendingRelayStatusUpdate) { // Chỉ forced report nếu không có update nào đang chờ debounce
+                AppLogger.debug("Core0", "Forced relay status report.");
+                String statusPayload = relayManager.getStatusJson(API_KEY);
+                // ... (publish MQTT) ...
+                lastForcedStatusReportTime = currentTime; // Cập nhật thời gian báo cáo bắt buộc
+           } else if (forcedReport && pendingRelayStatusUpdate) {
+               // Nếu đang chờ debounce và đến lúc forced report, có thể ưu tiên gửi ngay
+               // hoặc để debounce hoàn thành rồi coi đó là forced report.
+               // Ví dụ: gửi ngay
+               AppLogger.debug("Core0", "Forced relay status report (overriding debounce).");
+               String statusPayload = relayManager.getStatusJson(API_KEY);
+               // ... (publish MQTT) ...
+               pendingRelayStatusUpdate = false;
+               lastForcedStatusReportTime = currentTime;
+           }
+
+  - ****Ưu điểm:**** Giảm đáng kể số lượng tin nhắn MQTT trạng thái khi có nhiều thay đổi nhanh.
+
+  - ****Nhược điểm:**** Có độ trễ nhỏ (bằng thời gian debounce) trong việc cập nhật trạng thái lên server.
+
+* ****Throttling cập nhật trạng thái:****
+
+  - ****Ý tưởng:**** Chỉ cho phép gửi cập nhật trạng thái MQTT tối đa một lần trong một khoảng thời gian nhất định (ví dụ: mỗi 1 giây), bất kể có bao nhiêu thay đổi.
+
+  - ****Triển khai trong `Core0TaskCode`:****
+
+        // Trong main.cpp
+        unsigned long lastRelayStatusPublishTime = 0;
+        const unsigned long MIN_RELAY_STATUS_PUBLISH_INTERVAL_MS = 1000;
+
+        // Trong Core0TaskCode:
+        bool statusHasChanged = relayManager.hasStatusChangedAndReset(); // Kiểm tra một lần
+
+        if (statusHasChanged || forcedReport) {
+            if (currentTime - lastRelayStatusPublishTime >= MIN_RELAY_STATUS_PUBLISH_INTERVAL_MS || forcedReport) {
+                AppLogger.info("Core0", "Publishing relay status (throttled/forced).");
+                String statusPayload = relayManager.getStatusJson(API_KEY);
+                // ... (publish MQTT) ...
+                lastRelayStatusPublishTime = currentTime;
+                if (forcedReport) {
+                    lastForcedStatusReportTime = currentTime;
                 }
-            } else { // Tắt relay
-                digitalWrite(_relayPins[relayIndex], LOW);
-                _relayStatus[relayIndex].state = false;
-                AppLogger.info("RelayMgr", "Relay " + String(relayIndex + 1) + " TẮT.");
-                if (_relayStatus[relayIndex].timerHandle != NULL && xTimerIsTimerActive(_relayStatus[relayIndex].timerHandle)) {
-                    if (xTimerStop(_relayStatus[relayIndex].timerHandle, (TickType_t)0) != pdPASS) {
-                        AppLogger.error("RelayMgr", "Không thể dừng timer cho relay " + String(relayIndex + 1));
-                    }
-                }
-            }
-            
-            if (previousState != _relayStatus[relayIndex].state) {
-                _statusChanged = true;
-            }
-            
-            xSemaphoreGive(_mutex);
-        }
-    }
-
-    // Bật relay
-    void RelayManager::turnOn(int relayIndex, unsigned long duration) {
-        setRelay(relayIndex, true, duration);
-    }
-
-    // Tắt relay
-    void RelayManager::turnOff(int relayIndex) {
-        setRelay(relayIndex, false, 0);
-    }
-
-    // Lấy trạng thái relay
-    bool RelayManager::getState(int relayIndex) {
-        if (relayIndex < 0 || relayIndex >= _numRelays) {
-            return false;
-        }
-        bool state = false;
-        if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-            state = _relayStatus[relayIndex].state;
-            xSemaphoreGive(_mutex);
-        }
-        return state;
-    }
-
-    // Tạo payload JSON cho trạng thái relay
-    String RelayManager::getStatusJson(const char* apiKey) {
-        StaticJsonDocument<512> doc; // Kích thước có thể cần điều chỉnh cho 6 relay
-        doc["api_key"] = apiKey;
-        doc["timestamp"] = (uint32_t)time(NULL);
-        JsonArray relays = doc.createNestedArray("relays");
-        
-        if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-            for (int i = 0; i < _numRelays; i++) {
-                JsonObject relay = relays.createNestedObject();
-                relay["id"] = i + 1;
-                relay["state"] = _relayStatus[i].state;
-                
-                unsigned long remainingTimeMs = 0;
-                if (_relayStatus[i].timerHandle != NULL && xTimerIsTimerActive(_relayStatus[i].timerHandle)) {
-                    TickType_t expiryTimeTicks = xTimerGetExpiryTime(_relayStatus[i].timerHandle);
-                    TickType_t currentTimeTicks = xTaskGetTickCount(); // Lấy thời gian tick hiện tại
-                    if (expiryTimeTicks > currentTimeTicks) {
-                        remainingTimeMs = (expiryTimeTicks - currentTimeTicks) * portTICK_PERIOD_MS;
-                    }
-                }
-                relay["remaining_time"] = remainingTimeMs; 
-            }
-            xSemaphoreGive(_mutex);
-        }
-        
-        String payload;
-        serializeJson(doc, payload);
-        return payload;
-    }
-
-    // Xử lý JSON lệnh điều khiển
-    bool RelayManager::processCommand(const char* json) {
-        unsigned long cmdStartTime = millis();
-        bool commandParseSuccess = false;
-        String perfDetails = "";
-
-        AppLogger.debug("RelayMgrCmd", "Đã nhận JSON: " + String(json));
-        DynamicJsonDocument doc(512); 
-        DeserializationError error = deserializeJson(doc, json);
-
-        if (error) {
-            AppLogger.error("RelayMgr", "Phân tích JSON thất bại: " + String(error.c_str()));
-            perfDetails = "Phân tích JSON thất bại";
-            // Ghi log hiệu suất ở đây nếu cần
-            unsigned long cmdDuration = millis() - cmdStartTime;
-            AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, false, perfDetails);
-            return false;
-        }
-
-        if (!doc.containsKey("relays")) {
-            AppLogger.error("RelayMgr", "Lệnh thiếu trường 'relays'");
-            perfDetails = "Thiếu trường 'relays'";
-            unsigned long cmdDuration = millis() - cmdStartTime;
-            AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, false, perfDetails);
-            return false;
-        }
-
-        JsonArray relaysArray = doc["relays"];
-        if (relaysArray.isNull()) {
-            AppLogger.warning("RelayMgr", "Mảng 'relays' là null.");
-            perfDetails = "Mảng 'relays' là null";
-            unsigned long cmdDuration = millis() - cmdStartTime;
-            AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, true, perfDetails); // Vẫn parse thành công JSON
-            return false; 
-        }
-
-        commandParseSuccess = true;
-        bool anyChangeMadeByThisCommand = false; // Theo dõi thay đổi trong lệnh này
-        int relayCommandsInPayload = relaysArray.size();
-        int validRelayObjectsFound = 0;
-
-        for (JsonObject relayCmd : relaysArray) {
-            if (relayCmd.containsKey("id") && relayCmd.containsKey("state")) {
-                validRelayObjectsFound++;
-                int id = relayCmd["id"];
-                bool state = relayCmd["state"];
-                unsigned long duration = 0; 
-
-                if (relayCmd.containsKey("duration") && state) { 
-                    duration = relayCmd["duration"]; 
-                    // Nếu JSON gửi đơn vị là giây, chuyển đổi sang mili giây
-                    // Ví dụ: nếu duration từ JSON là số giây:
-                    // duration = relayCmd["duration"].as<unsigned long>() * 1000;
-                    // Nếu JSON đã gửi mili giây thì không cần nhân.
-                    // Giả sử JSON gửi mili giây cho duration.
-                }
-
-                if (id >= 1 && id <= _numRelays) {
-                    int relayIndex = id - 1;
-                    
-                    // Ghi lại trạng thái _statusChanged trước khi gọi setRelay
-                    bool statusChangedBeforeSetRelay = false;
-                    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(10))) {
-                        statusChangedBeforeSetRelay = _statusChanged;
-                        xSemaphoreGive(_mutex);
-                    }
-
-                    setRelay(relayIndex, state, duration);
-
-                    // Kiểm tra xem setRelay có thực sự thay đổi trạng thái không
-                    bool statusChangedAfterSetRelay = false;
-                     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(10))) {
-                        statusChangedAfterSetRelay = _statusChanged;
-                        xSemaphoreGive(_mutex);
-                    }
-                    // Nếu _statusChanged được set thành true bởi setRelay (và nó không phải là true từ trước đó do lệnh khác trong cùng payload)
-                    // thì lệnh này đã gây ra thay đổi.
-                    if (statusChangedAfterSetRelay && (statusChangedAfterSetRelay != statusChangedBeforeSetRelay || state != getState(relayIndex) /*cần cẩn thận race condition*/ )) {
-                         anyChangeMadeByThisCommand = true;
-                    }
-
-
-                } else {
-                    AppLogger.error("RelayMgr", "ID relay không hợp lệ: " + String(id) + " trong lệnh.");
-                }
-            }
-        }
-        
-        if (validRelayObjectsFound > 0) {
-            perfDetails = String(validRelayObjectsFound) + "/" + String(relayCommandsInPayload) + " đối tượng relay hợp lệ. ";
-            // anyChangeMadeByThisCommand phản ánh chính xác hơn là _statusChanged (vì _statusChanged là toàn cục cho tất cả thay đổi)
-            if(anyChangeMadeByThisCommand) perfDetails += "Trạng thái đã thay đổi bởi lệnh này."; else perfDetails += "Không có thay đổi trạng thái bởi lệnh này.";
-        } else if (relayCommandsInPayload > 0) {
-            perfDetails = "Không có đối tượng relay hợp lệ trong mảng 'relays' kích thước " + String(relayCommandsInPayload);
-            commandParseSuccess = false;
-        } else {
-            perfDetails = "Mảng 'relays' trống.";
-        }
-
-        unsigned long cmdDuration = millis() - cmdStartTime;
-        AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, commandParseSuccess, perfDetails);
-
-        return anyChangeMadeByThisCommand; 
-    }
-
-    // Kiểm tra xem trạng thái có thay đổi không và reset cờ
-    bool RelayManager::hasStatusChangedAndReset() {
-        bool changed = false;
-        if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-            changed = _statusChanged;
-            _statusChanged = false; 
-            xSemaphoreGive(_mutex);
-        }
-        return changed;
-    }
-
-**Các thay đổi chính trong `RelayManager.cpp`:**
-
-- **`relayTimerCallback`**:
-
-  - Hàm static này được gọi khi software timer hết hạn.
-
-  - Lấy `relayIndex` từ ID của timer.
-
-  - Tạo `RelayTimerEvent_t` và gửi vào `g_relayEventQueue`.
-
-- **`begin`**:
-
-  - Khởi tạo `_relayStatus` và tạo một software timer (`xTimerCreate`) cho mỗi relay. Timer ID được đặt là `relayIndex`.
-
-- **`setRelay`**:
-
-  - Khi bật relay có `duration`: Thay đổi chu kỳ (`xTimerChangePeriod`) và khởi động (`xTimerStart`) software timer.
-
-  - Khi bật relay vô thời hạn hoặc tắt relay: Dừng (`xTimerStop`) software timer nếu nó đang hoạt động.
-
-- **`getStatusJson`**:
-
-  - Tính `remaining_time` dựa trên `xTimerIsTimerActive()` và `xTimerGetExpiryTime()` để lấy thời gian còn lại của timer.
-
-- **`processCommand`**: Logic phân tích JSON được giữ nguyên, nhưng việc bật/tắt relay giờ đây sẽ kích hoạt/dừng software timer tương ứng. Cần tinh chỉnh cách xác định `anyChangeMadeByThisCommand` để phản ánh chính xác hơn.
-
-
-## 4. Cập Nhật `main.cpp`
-
-Tệp `main.cpp` cần khởi tạo queue và sửa đổi `Core1TaskCode` để xử lý sự kiện từ queue.
-
-    #include <Arduino.h>
-    #include "../include/WS_GPIO.h"
-    #include "../include/SensorManager.h"
-    #include "../include/NetworkManager.h"
-    #include "../include/RelayManager.h" // Đã được cập nhật
-    #include "../include/TaskScheduler.h"
-    #include "../include/EnvironmentManager.h"
-    #include "../include/Logger.h"
-    #include <time.h>
-    #include <Preferences.h>
-    #include "freertos/FreeRTOS.h" 
-    #include "freertos/task.h"
-    #include "freertos/queue.h"    
-
-    // ... (Các hằng số và khai báo khác giữ nguyên) ...
-
-    // Sensor and manager objects
-    SensorManager sensorManager;
-    NetworkManager networkManager;
-    RelayManager relayManager; 
-    EnvironmentManager envManager(sensorManager);
-    TaskScheduler taskScheduler(relayManager, envManager);
-
-    SemaphoreHandle_t sensorDataMutex;
-
-    // Khai báo QueueHandle_t toàn cục cho sự kiện Relay Timer
-    QueueHandle_t g_relayEventQueue; 
-
-    // ... (mqttCallback và các hàm khác giữ nguyên) ...
-
-    // Core 0 Task - Handles sensors, network, MQTT (preemptive)
-    void Core0TaskCode(void * parameter) {
-      AppLogger.info("Core0", "Task bắt đầu trên core " + String(xPortGetCoreID()));
-      
-      for(;;) {
-        networkManager.loop();
-        unsigned long currentTime = millis();
-        
-        // Đọc cảm biến và gửi dữ liệu (logic giữ nguyên)
-        if (currentTime - lastSensorReadTime >= sensorReadInterval) {
-          lastSensorReadTime = currentTime;
-          if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
-            unsigned long sensorReadStartTime = millis();
-            bool readSuccess = false;
-            if (sensorManager.readSensors()) {
-              readSuccess = true;
-              envManager.setCurrentTemperature(sensorManager.getTemperature());
-              envManager.setCurrentHumidity(sensorManager.getHumidity());
-              envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
-              AppLogger.debug("Core0", "Sensors read: T=" + String(sensorManager.getTemperature()) +
-                              "°C, H=" + String(sensorManager.getHumidity()) +
-                              "%, HI=" + String(sensorManager.getHeatIndex()) + "°C");
-              if (networkManager.isConnected()) {
-                String payload = sensorManager.getJsonPayload(API_KEY);
-                unsigned long mqttPublishStartTime = millis();
-                bool mqttSuccess = networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
-                unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
-                AppLogger.perf("Core0", "MQTTSensorDataPublish", mqttPublishDuration, mqttSuccess);
-                AppLogger.debug("Core0", "Sensor data published to MQTT");
-              } else {
-                AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
-              }
             } else {
-              AppLogger.error("Core0", "Failed to read from sensors");
-              readSuccess = false;
+                // Thay đổi xảy ra quá nhanh, sẽ được tổng hợp trong lần publish sau.
+                // Cần đảm bảo _statusChanged được set lại nếu không publish,
+                // nhưng hasStatusChangedAndReset() đã reset nó.
+                // Để đảm bảo không mất trạng thái, có thể cần một cờ riêng:
+                // static bool _internalStatusChangedFlag = false;
+                // if (statusHasChanged) _internalStatusChangedFlag = true;
+                // Và trong điều kiện publish: if ((_internalStatusChangedFlag && (currentTime - ...)) || forcedReport)
+                // Sau đó reset _internalStatusChangedFlag.
+                // Tuy nhiên, cách đơn giản hơn là chấp nhận rằng nếu thay đổi xảy ra
+                // và bị throttle, thì lần publish tiếp theo (do forced hoặc thay đổi sau đó) sẽ lấy trạng thái mới nhất.
+                AppLogger.debug("Core0", "Relay status change throttled.");
             }
-            unsigned long sensorReadDuration = millis() - sensorReadStartTime;
-            AppLogger.perf("Core0", "SensorReadOperation", sensorReadDuration, readSuccess);
-            xSemaphoreGive(sensorDataMutex);
-          }
         }
-        
-        // Publish relay và scheduler status khi có thay đổi hoặc cần gửi dự phòng
-        if (networkManager.isConnected()) {
-          bool forcedReport = (currentTime - lastForcedStatusReportTime >= forcedStatusReportInterval);
-          
-          if (relayManager.hasStatusChangedAndReset() || forcedReport) { 
-            String statusPayload = relayManager.getStatusJson(API_KEY);
-            unsigned long mqttPublishStartTime = millis();
-            bool mqttSuccess = networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
-            unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
-            AppLogger.perf("Core0", "MQTTRelayStatusPublish", mqttPublishDuration, mqttSuccess);
-            if (forcedReport) {
-              AppLogger.debug("Core0", "Trạng thái relay đã được publish lên MQTT (báo cáo bắt buộc)");
-            } else {
-              AppLogger.debug("Core0", "Trạng thái relay đã được publish lên MQTT");
-            }
-          }
-          
-          if (taskScheduler.hasScheduleStatusChangedAndReset() || forcedReport) {
-            String schedulePayload = taskScheduler.getTasksJson(API_KEY);
-            networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
-             if (forcedReport) {
-              AppLogger.debug("Core0", "Schedule status published to MQTT (forced report)");
-            } else {
-              AppLogger.debug("Core0", "Schedule status published to MQTT");
-            }
-          }
-          
-          if (forcedReport) {
-            lastForcedStatusReportTime = currentTime;
-          }
-        }
-        
-        // Check and update irrigation schedules (logic giữ nguyên)
-        time_t current_time_for_scheduler;
-        time(&current_time_for_scheduler);
-        time_t next_check = taskScheduler.getEarliestNextCheckTime();
-        if (next_check == 0 || current_time_for_scheduler >= next_check) {
-          taskScheduler.update();
-        }
-        
-        // Blink LED (logic giữ nguyên)
-         if (currentTime - lastLedBlinkTime >= ledBlinkInterval) {
-          lastLedBlinkTime = currentTime;
-          ledState = !ledState; 
-          if (networkManager.isConnected()) {
-            if (ledState) { RGB_Light(0, 20, 0); } else { RGB_Light(0, 0, 0); }
-          } else if (networkManager.isAttemptingWifiReconnect() || networkManager.isAttemptingMqttReconnect()) {
-            if (ledState) { RGB_Light(0, 0, 20); } else { RGB_Light(0, 0, 0); }
-          } else if (!networkManager.isWifiConnected()){
-            if (ledState) { RGB_Light(20, 0, 0); } else { RGB_Light(0, 0, 0); }
-          } else { 
-             if (ledState) { RGB_Light(20, 20, 0); } else { RGB_Light(0, 0, 0); }
-          }
-        }
-        
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-      }
-    }
 
-    // Core 1 Task - Xử lý sự kiện từ Relay Timer Queue
-    void Core1TaskCode(void * parameter) {
-      AppLogger.info("Core1", "Task bắt đầu trên core " + String(xPortGetCoreID()));
-      RelayTimerEvent_t receivedEvent;
+  - ****Ưu điểm:**** Đảm bảo tần suất gửi tối đa, dễ dự đoán hơn.
 
-      for(;;) {
-        // Chờ sự kiện từ g_relayEventQueue
-        if (xQueueReceive(g_relayEventQueue, &receivedEvent, portMAX_DELAY) == pdPASS) {
-          AppLogger.info("Core1", "Đã nhận sự kiện hết hạn timer cho relay index: " + String(receivedEvent.relayIndex));
-          // Gọi RelayManager để tắt relay tương ứng
-          // Hàm turnOff của RelayManager sẽ set _statusChanged,
-          // Core0Task sẽ phát hiện và gửi cập nhật trạng thái MQTT.
-          relayManager.turnOff(receivedEvent.relayIndex);
-        }
-        // Task sẽ bị block bởi xQueueReceive cho đến khi có sự kiện,
-        // không cần vTaskDelay cố định ở đây nữa.
-      }
-    }
+  - ****Nhược điểm:**** Có thể bỏ lỡ việc báo cáo các trạng thái trung gian nếu thay đổi xảy ra nhanh hơn khoảng thời gian throttle.
+------------------------------------------------------------------------------------------------------------------------------------
 
-    void setup() {
-      Serial.begin(115200);
-      uint32_t serialStartTime = millis();
-      while (!Serial && (millis() - serialStartTime < 2000)) { 
-        delay(10);
-      }
-      Serial.println(F("\n\nMain: Serial port initialized."));
+### 4. Tối ưu hóa Logging
 
-      // Khởi tạo Queue cho sự kiện Relay Timer
-      g_relayEventQueue = xQueueCreate(10, sizeof(RelayTimerEvent_t)); // 10 là kích thước queue
-      if (g_relayEventQueue == NULL) {
-          Serial.println(F("Main: LỖI - Không thể tạo relay event queue!"));
-          ESP.restart(); // Hoặc xử lý lỗi nghiêm trọng khác
-      } else {
-          Serial.println(F("Main: Relay event queue đã được tạo."));
-      }
+****Vấn đề:**** Logging quá nhiều, đặc biệt là các log `DEBUG` hoặc `perf` được gửi qua MQTT, có thể gây tắc nghẽn mạng và tiêu tốn CPU.****Giải pháp chi tiết:***** ****Sử dụng mức log phù hợp cho MQTT trong môi trường production:****
 
-      // Initialize NetworkManager (logic giữ nguyên)
-      if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
-        // Serial.println(F("Main: NetworkManager failed to initialize properly. Check logs. System will attempt to reconnect."));
-        // AppLogger sẽ được khởi tạo sau, nên dùng Serial ở đây nếu cần log sớm
-      } else {
-        // Serial.println(F("Main: NetworkManager initialized. Attempting to connect..."));
-      }
-      
-      // Initialize Logger
-      AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO); 
-      
-      networkManager.setCallback(mqttCallback); // Đặt callback MQTT sau khi logger sẵn sàng
-      AppLogger.info("Setup", "MQTT Callback function set.");
+  - Trong `AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);`, mức `LOG_LEVEL_INFO` cho MQTT là một khởi đầu tốt. Tuy nhiên, nếu `AppLogger.perf` được gọi thường xuyên và nó ghi ở mức `INFO`, lượng log vẫn có thể lớn.
 
+  - ****Điều chỉnh mức log cho `perf`:****
 
-      AppLogger.info("Setup", "Hệ thống đang khởi tạo...");
-      AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");
+    - Trong `Logger::perf`, hiện tại đang ghi ở `LOG_LEVEL_INFO`. Bạn có thể đổi thành `LOG_LEVEL_DEBUG`:
 
-      sensorDataMutex = xSemaphoreCreateMutex();
-      
-      AppLogger.debug("Setup", "Đang khởi tạo GPIO...");
-      GPIO_Init();
-      AppLogger.info("Setup", "GPIO đã khởi tạo");
-      
-      AppLogger.debug("Setup", "Đang khởi tạo RelayManager...");
-      relayManager.begin(relayPins, numRelays, g_relayEventQueue); // Truyền queue vào
-      
-      AppLogger.debug("Setup", "Đang khởi tạo TaskScheduler...");
-      taskScheduler.begin();
-      
-      AppLogger.debug("Setup", "Đang khởi tạo SensorManager...");
-      sensorManager.begin();
-      
-      // Đăng ký các topic MQTT (logic giữ nguyên)
-      networkManager.subscribe(MQTT_TOPIC_CONTROL);
-      networkManager.subscribe(MQTT_TOPIC_SCHEDULE);
-      networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL);
-      networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG);
-        
-      AppLogger.info("Setup", "Đang tạo và ghim task vào các core...");
-      xTaskCreatePinnedToCore(
-        Core0TaskCode, "Core0Task", STACK_SIZE_CORE0, NULL, PRIORITY_MEDIUM, &core0Task, 0);
-      xTaskCreatePinnedToCore(
-        Core1TaskCode, "Core1Task", STACK_SIZE_CORE1, NULL, PRIORITY_MEDIUM, &core1Task, 1); 
-        
-      AppLogger.info("Setup", "Hoàn tất khởi tạo hệ thống. Các task đang chạy.");
-      AppLogger.info("Setup", "---------------- HỆ THỐNG SẴN SÀNG ----------------");
-    }
+          // void Logger::perf(...) {
+          //     LogLevel level = LOG_LEVEL_DEBUG; // Thay vì INFO
+          //     // ...
+          // }
 
-    void loop() {
-      static unsigned long lastStackCheckTime = 0;
-      if (millis() - lastStackCheckTime > 60000) { 
-        lastStackCheckTime = millis();
-        if(core0Task != NULL) { 
-            UBaseType_t core0StackHWM = uxTaskGetStackHighWaterMark(core0Task);
-            AppLogger.info("StackCheck", "Core0Task HWM: " + String(core0StackHWM) + " words (" + String(core0StackHWM * sizeof(StackType_t)) + " bytes)");
-        }
-        if(core1Task != NULL) {
-            UBaseType_t core1StackHWM = uxTaskGetStackHighWaterMark(core1Task);
-            AppLogger.info("StackCheck", "Core1Task HWM: " + String(core1StackHWM) + " words (" + String(core1StackHWM * sizeof(StackType_t)) + " bytes)");
-        }
-      }
-      vTaskDelay(1000 / portTICK_PERIOD_MS); 
-    }
+      Như vậy, khi MQTT log level được đặt là `INFO` hoặc `WARNING`, các log `perf` sẽ không được gửi qua MQTT.
 
-**Các thay đổi chính trong `main.cpp`:**
+  - ****Sử dụng tính năng cấu hình log động:**** Như đã triển khai, cho phép thay đổi `mqttLogLevel` thành `LOG_LEVEL_WARNING` hoặc `LOG_LEVEL_ERROR` khi hệ thống đang chịu tải cao để giảm thiểu log MQTT.
 
-- **`g_relayEventQueue`**: Khai báo một `QueueHandle_t` toàn cục.
+* ****Tối ưu hóa `Logger::perf` cho Serial Output:****
 
-- **`setup()`**:
+  - Việc xây dựng chuỗi `logString` trong `Logger::perf` cho Serial bằng cách ghép `String` nhiều lần có thể không hiệu quả bằng `snprintf`.
 
-  - Khởi tạo `g_relayEventQueue` bằng `xQueueCreate()`.
+        // Trong Logger::perf, phần cho Serial:
+        // if (shouldLogSerial && Serial) {
+        //     // ...
+        //     char serialPerfBuffer[200]; // Điều chỉnh kích thước nếu cần
+        //     snprintf(serialPerfBuffer, sizeof(serialPerfBuffer),
+        //              "%lu [%s] [%s] [Core:%d, Heap:%lu]: PERF: Event='%s', Duration=%lums, Success=%s%s%s",
+        //              entry.timestamp,
+        //              levelToString(entry.level).c_str(),
+        //              entry.tag.c_str(),
+        //              (int)xPortGetCoreID(), // Ép kiểu để phù hợp với %d hoặc %u
+        //              (unsigned long)ESP.getFreeHeap(), // Ép kiểu
+        //              eventName.c_str(),
+        //              durationMs,
+        //              success ? "true" : "false",
+        //              details.isEmpty() ? "" : ", Details='",
+        //              details.isEmpty() ? "" : details.c_str());
+        //     if (!details.isEmpty()) { // Thêm dấu nháy đóng nếu có details
+        //         size_t currentLen = strlen(serialPerfBuffer);
+        //         if (currentLen < sizeof(serialPerfBuffer) - 2) { // Đảm bảo đủ chỗ
+        //            serialPerfBuffer[currentLen] = '\'';
+        //            serialPerfBuffer[currentLen+1] = '\0';
+        //         }
+        //     }
+        //     Serial.println(serialPerfBuffer);
+        // }
 
-  - Truyền `g_relayEventQueue` vào `relayManager.begin()`.
+  - ****Lưu ý:**** `snprintf` an toàn hơn `sprintf` vì nó giới hạn số byte được ghi. Đảm bảo buffer đủ lớn.
+-----------------------------------------------------------------------------------------------------------
 
-- **`Core1TaskCode`**:
+### 5. Ưu Tiên Task và Lập Lịch (Đã Tương Đối Tốt)
 
-  - Không còn gọi `relayManager.update()`.
+## ****Hiện trạng:***** `Core0Task` (network, sensors, MQTT publish, scheduler check): `PRIORITY_MEDIUM`.
 
-  - Chờ nhận sự kiện `RelayTimerEvent_t` từ `g_relayEventQueue` bằng `xQueueReceive()`.
+* `Core1Task` (relay timer event processing): `PRIORITY_MEDIUM`.****Phân tích:***** `Core0Task` làm nhiều việc hơn và quan trọng cho việc nhận lệnh. `Core1Task` chỉ xử lý sự kiện từ queue, công việc nhẹ nhàng.
 
-  - Khi nhận được sự kiện, gọi `relayManager.turnOff()` cho relay tương ứng.
+* Nếu có nhiều lệnh MQTT đến dồn dập, `Core0Task` cần được ưu tiên để xử lý chúng nhanh chóng.
 
-- **`Core0TaskCode`**: Logic gửi trạng thái relay lên MQTT không thay đổi đáng kể, vì `relayManager.hasStatusChangedAndReset()` vẫn sẽ được kích hoạt khi `relayManager.turnOff()` (do `Core1TaskCode` gọi) thay đổi trạng thái relay.
+* ****Cân nhắc:**** Nếu có dấu hiệu `Core0Task` bị chậm trễ trong việc xử lý network I/O do các công việc khác (ví dụ: sensor reading, scheduler update quá lâu), bạn có thể:
 
+  - Tăng nhẹ ưu tiên của `Core0Task` (ví dụ `PRIORITY_MEDIUM + 1`) so với các task khác có thể chạy trên Core 0 (nếu có). Tuy nhiên, cẩn thận để không gây starvation cho các task hệ thống chạy trên Core 0.
 
-## 5. Giải Thích Luồng Hoạt Động Mới
+  - Đảm bảo các hàm được gọi bởi `Core0Task` (như `sensorManager.readSensors()`, `taskScheduler.update()`) không blocking quá lâu. Logic hiện tại có vẻ ổn (ví dụ `sensorReadInterval` là 30 giây).
 
-1. **Bật Relay Có Thời Gian:**
+### 6. Xử Lý Mạng (MQTT Client Buffer)
 
-   - Lệnh MQTT đến `Core0Task` -> `relayManager.processCommand()` -> `relayManager.setRelay(X, true, D)`.
+## ****Hiện trạng:**** `_mqttClient.setBufferSize(1024);` trong `NetworkManager::begin`.****Phân tích:***** Buffer này được PubSubClient sử dụng cho cả tin nhắn đến và đi.
 
-   - `setRelay` bật relay vật lý và khởi động một software timer (liên kết với relay X) để hết hạn sau D mili giây.
+* Nếu bạn gửi nhiều lệnh điều khiển relay trong một tin nhắn MQTT duy nhất và payload đó lớn, hoặc nếu trạng thái JSON (`getStatusJson`) rất lớn, buffer này có thể không đủ.
 
-2. **Timer Hết Hạn:**
+* ****Kiểm tra:****
 
-   - Sau D mili giây, software timer của relay X kích hoạt hàm `RelayManager::relayTimerCallback`.
+  - Kích thước tối đa của payload lệnh điều khiển.
 
-   - `relayTimerCallback` gửi một `RelayTimerEvent_t` (chứa `relayIndex = X`) vào `g_relayEventQueue`.
+  - Kích thước tối đa của payload trạng thái (`getStatusJson` trả về, `RelayManager.cpp` dùng `StaticJsonDocument<512>`).
 
-3. **Xử** Lý Sự **Kiện trên Core 1:**
+  - Kích thước tối đa của payload log MQTT (`Logger.cpp` dùng `StaticJsonDocument<512>`).
 
-   - `Core1TaskCode` đang chờ trên `g_relayEventQueue`. Khi có sự kiện, nó được đánh thức.
+* ****Hành động:****
 
-   - Nhận được `relayIndex = X`.
+  - Nếu tổng kích thước có thể vượt quá 1024 byte (ví dụ, một log rất dài, hoặc một payload trạng thái lớn), hãy tăng `MQTT_MAX_PACKET_SIZE` trong `PubSubClient.h` (nếu sửa thư viện) hoặc đảm bảo các payload gửi đi được chia nhỏ nếu cần. Thông thường, `setBufferSize` của PubSubClient là cho buffer nhận. Kích thước gói tin gửi đi thường được giới hạn bởi `MQTT_MAX_PACKET_SIZE` trong cấu hình thư viện.
 
-   - Gọi `relayManager.turnOff(X)`. Hàm này tắt relay vật lý và đặt cờ `_statusChanged = true` trong `RelayManager`.
+  - Đối với thư viện PubSubClient chuẩn, `setBufferSize` chủ yếu ảnh hưởng đến việc xử lý các tin nhắn đến lớn và khả năng lưu trữ các tin nhắn đi trong khi chờ publish. Nếu bạn thường xuyên gửi các gói tin lớn hơn 128 byte (mặc định của `MQTT_MAX_PACKET_SIZE` trong một số phiên bản), bạn có thể cần phải định nghĩa lại `MQTT_MAX_PACKET_SIZE` khi biên dịch hoặc chọn một thư viện MQTT client khác linh hoạt hơn. Tuy nhiên, 1024 byte cho `setBufferSize` thường là đủ cho hầu hết các ứng dụng không truyền file lớn.
 
-4. **Cập Nhật Trạng Thái MQTT (trên Core 0):**
+### 7. Đệm Lệnh Đầu Vào (Giải Pháp Nâng Cao)
 
-   - Trong vòng lặp tiếp theo, `Core0TaskCode` gọi `relayManager.hasStatusChangedAndReset()`, phát hiện có sự thay đổi.
+****Vấn đề:**** Nếu `RelayManager::processCommand` (bao gồm cả phân tích JSON và các lệnh gọi `setRelay`) mất quá nhiều thời gian, `mqttCallback` có thể giữ `Core0Task` bị chặn, làm chậm việc xử lý các tin nhắn MQTT khác.****Giải pháp chi tiết:***** ****Ý tưởng:**** Thay vì xử lý lệnh trực tiếp trong `mqttCallback`, hãy đưa lệnh (chuỗi JSON thô) vào một hàng đợi (FreeRTOS Queue). Một task riêng (worker task) sẽ đọc từ hàng đợi này và thực thi `RelayManager::processCommand`.
 
-   - Lấy trạng thái relay mới (`relayManager.getStatusJson()`) và gửi lên MQTT.
+* ****Triển khai:****
 
+  1. ****Định nghĩa Queue và Task Worker:****
 
-## 6. Các Bước Tiếp Theo và Lưu Ý
+         // Trong main.cpp
+         QueueHandle_t g_mqttCommandQueue;
+         TaskHandle_t mqttCommandProcessorTaskHandle;
+         #define MQTT_CMD_QUEUE_LENGTH 10
+         #define MAX_MQTT_CMD_LENGTH 512 // Kích thước tối đa của một payload lệnh
 
-- **Biên Dịch và Kiểm Thử Kỹ Lưỡng:** Đây là bước quan trọng nhất. Kiểm tra các kịch bản:
+         // Struct để chứa lệnh MQTT
+         typedef struct {
+             char payload[MAX_MQTT_CMD_LENGTH];
+         } MqttCommand_t;
 
-  - Bật relay vô thời hạn.
+         void MqttCommandProcessorTask(void *pvParameters) {
+             MqttCommand_t receivedCommand;
+             AppLogger.info("MqttCmdProc", "Task started on core " + String(xPortGetCoreID()));
+             for (;;) {
+                 if (xQueueReceive(g_mqttCommandQueue, &receivedCommand, portMAX_DELAY) == pdPASS) {
+                     AppLogger.debug("MqttCmdProc", "Processing command from queue: " + String(receivedCommand.payload));
+                     // Gọi hàm xử lý lệnh ở đây, ví dụ:
+                     // relayManager.processCommand(receivedCommand.payload);
+                     // hoặc taskScheduler.processCommand(receivedCommand.payload);
+                     // Tùy thuộc vào topic, bạn có thể cần một struct phức tạp hơn để chứa cả topic và payload
+                     // Hoặc có các queue riêng cho từng loại lệnh.
+                     // Giả sử đây là queue cho relay control:
+                     relayManager.processCommand(receivedCommand.payload);
+                 }
+             }
+         }
 
-  - Bật relay có thời gian.
+  2. ****Khởi tạo Queue và Task trong `setup()`:****
 
-  - Tắt relay đang chạy có thời gian (thủ công).
+         // Trong setup()
+         g_mqttCommandQueue = xQueueCreate(MQTT_CMD_QUEUE_LENGTH, sizeof(MqttCommand_t));
+         if (g_mqttCommandQueue == NULL) {
+             AppLogger.critical("Setup", "FATAL - Failed to create MQTT command queue!");
+             ESP.restart();
+         } else {
+             AppLogger.info("Setup", "MQTT command queue created.");
+         }
 
-  - Relay tự tắt khi hết thời gian.
+         xTaskCreatePinnedToCore(
+             MqttCommandProcessorTask,
+             "MqttCmdProcTask",
+             4096, // Điều chỉnh stack size
+             NULL,
+             PRIORITY_MEDIUM, // Điều chỉnh ưu tiên
+             &mqttCommandProcessorTaskHandle,
+             1 // Chạy trên Core 1 để giảm tải cho Core 0
+         );
 
-  - Gửi nhiều lệnh điều khiển relay liên tiếp.
+  3. ****Sửa đổi `mqttCallback`:****
 
-- **Tinh Chỉnh `RelayManager::getStatusJson`:** Đảm bảo `remaining_time` được tính toán chính xác từ trạng thái của software timer (sử dụng `xTimerIsTimerActive()` và `xTimerGetExpiryTime()`).
+         // Trong mqttCallback
+         // if (strcmp(topic, MQTT_TOPIC_CONTROL) == 0) {
+         //    // relayManager.processCommand(message); // Xử lý trực tiếp (cũ)
+         //
+         //    // Xử lý qua queue (mới)
+         //    if (strlen(message) < MAX_MQTT_CMD_LENGTH) {
+         //        MqttCommand_t cmdToSend;
+         //        strncpy(cmdToSend.payload, message, MAX_MQTT_CMD_LENGTH);
+         //        cmdToSend.payload[MAX_MQTT_CMD_LENGTH - 1] = '\0'; // Đảm bảo null-terminated
+         //
+         //        if (xQueueSend(g_mqttCommandQueue, &cmdToSend, pdMS_TO_TICKS(100)) != pdPASS) { // Timeout ngắn
+         //            AppLogger.error("MQTTCallbk", "Failed to send command to queue (relay control).");
+         //        } else {
+         //            AppLogger.debug("MQTTCallbk", "Relay command enqueued.");
+         //        }
+         //    } else {
+         //        AppLogger.error("MQTTCallbk", "Relay command payload too long for queue.");
+         //    }
+         // }
 
-- **Xử Lý Lỗi FreeRTOS:** Thêm kiểm tra giá trị trả về của các hàm FreeRTOS (ví dụ: `xTimerCreate`, `xQueueCreate`, `xQueueSend` có thể thất bại nếu hết bộ nhớ) và ghi log lỗi tương ứng.
+* ****Ưu điểm:**** Giải phóng `mqttCallback` và `Core0Task` nhanh chóng, cải thiện khả năng phản hồi của hệ thống với các tin nhắn MQTT đến. Cho phép xử lý lệnh phức tạp hơn mà không ảnh hưởng đến network I/O.
 
-- **Truy Cập Queue trong Callback:** Cách sử dụng `g_relayEventQueue` là một giải pháp đơn giản. Đối với các dự án lớn hơn hoặc khi cần nhiều instance `RelayManager`, bạn có thể cần các giải pháp phức tạp hơn để hàm static callback có thể gửi sự kiện đến đúng queue của instance (ví dụ: lưu con trỏ `this` của `RelayManager` vào Timer ID khi tạo timer, sau đó trong callback lấy lại con trỏ này để truy cập `_relayEventQueue` của instance đó). Tuy nhiên, việc này cần cẩn thận vì Timer ID thường được dùng cho dữ liệu đơn giản.
+* ****Nhược điểm:**** Tăng độ phức tạp (thêm task và queue). Có độ trễ nhỏ do lệnh phải qua queue. Cần quản lý kích thước queue và xử lý trường hợp queue đầy.
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-- **Mở Rộng Kiến Trúc Event-Driven:** Áp dụng các nguyên tắc tương tự (software timers, queues, event groups) cho các module khác như `TaskScheduler` (ví dụ: dùng software timer để kích hoạt kiểm tra lịch) và `SensorManager` (ví dụ: dùng
+### Kết luận và Các Bước Tiếp Theo
+
+## 1. **Ưu tiên các giải pháp dễ thực hiện và có tác động lớn trước:**
+
+   - Chuyển sang `StaticJsonDocument` cho `processCommand`.
+
+   - Triển khai debouncing/throttling cho cập nhật trạng thái MQTT.
+
+   - Điều chỉnh mức log cho `AppLogger.perf` và sử dụng cấu hình log động.
+
+   - Tối ưu hóa logic kiểm tra thay đổi trong `processCommand` để giảm khóa mutex.
+
+2. **Kiểm thử kỹ lưỡng sau mỗi thay đổi:** Sử dụng `benchmark.py` và giám sát log `perf` để đánh giá tác động của các thay đổi.
+
+3. **Xem xét các giải pháp nâng cao (như đệm lệnh đầu vào) nếu các tối ưu hóa trên vẫn chưa đủ** cho kịch bản tải nặng của bạn.Bằng cách áp dụng có hệ thống các kỹ thuật này, bạn có thể cải thiện đáng kể hiệu suất và độ ổn định của hệ thống ESP32-S3 6-Relay khi đối mặt với lượng lớn lệnh điều khiển.

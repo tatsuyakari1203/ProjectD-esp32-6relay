@@ -1,34 +1,37 @@
 #include "../include/Logger.h" // Path to Logger.h
 #include <time.h>               // To use time() for Unix timestamp
-#include <stdarg.h>             // To use va_list, va_start, va_end for logf function
+#include <stdarg.h>             // For va_list, va_start, va_end in logf
 
-// Define the global AppLogger variable
+// Global AppLogger instance
 Logger AppLogger;
 
-// API key from main.cpp
+// External declaration for API_KEY (defined in main.cpp)
 extern const char* API_KEY;
 
 Logger::Logger() : _networkManager(nullptr), _serialLogLevel(LOG_LEVEL_NONE), _mqttLogLevel(LOG_LEVEL_NONE), _apiKey(nullptr) {
-    // Default constructor
+    // Constructor
 }
 
 void Logger::begin(NetworkManager* networkManager, LogLevel initialSerialLogLevel, LogLevel initialMqttLogLevel) {
     _networkManager = networkManager;
-    setSerialLogLevel(initialSerialLogLevel); // Use setter to get a log message for the change
-    setMqttLogLevel(initialMqttLogLevel);   // Use setter
+    setSerialLogLevel(initialSerialLogLevel); // Use setter to log the change itself
+    setMqttLogLevel(initialMqttLogLevel);   // Use setter for consistency
 
-    // Store API key from main.cpp
-    _apiKey = API_KEY;
+    _apiKey = API_KEY; // Store the API key from main.cpp
     
-    // Log Logger initialization message (will only appear if Serial is configured for INFO level or higher)
+    // Log Logger initialization. This message appears if Serial log level is INFO or higher
     // and Serial.begin() has been called.
     if (_serialLogLevel >= LOG_LEVEL_INFO && Serial) {
-         Serial.println(String(millis()) + " [INFO] [Logger]: Logger initialized. Serial LogLevel: " + levelToString(_serialLogLevel) + ", MQTT LogLevel: " + levelToString(_mqttLogLevel));
+         char logBuffer[200];
+         snprintf(logBuffer, sizeof(logBuffer), "%lu [INFO] [Logger]: Logger initialized. Serial LogLevel: %s, MQTT LogLevel: %s", millis(), levelToString(_serialLogLevel).c_str(), levelToString(_mqttLogLevel).c_str());
+         Serial.println(logBuffer);
          if (_mqttLogLevel > LOG_LEVEL_NONE) {
             if (_networkManager && _networkManager->isConnected()) {
-                Serial.println(String(millis()) + " [INFO] [Logger]: MQTT logging active.");
+                snprintf(logBuffer, sizeof(logBuffer), "%lu [INFO] [Logger]: MQTT logging active.", millis());
+                Serial.println(logBuffer);
             } else {
-                Serial.println(String(millis()) + " [WARNING] [Logger]: MQTT logging configured, but NetworkManager not available or not connected at init.");
+                snprintf(logBuffer, sizeof(logBuffer), "%lu [WARNING] [Logger]: MQTT logging configured, but NetworkManager not available or not connected at init.", millis());
+                Serial.println(logBuffer);
             }
          }
     }
@@ -55,10 +58,9 @@ void Logger::debug(const String& tag, const String& message) {
     log(LOG_LEVEL_DEBUG, tag, message);
 }
 
-// Main log function, handles LogEntry creation and calls processLogEntry
+// Main logging function. Creates a LogEntry and processes it.
 void Logger::log(LogLevel level, const String& tag, const String& message) {
-    // Only process if the message's log level is important enough to be recorded
-    // by at least one target (Serial or MQTT)
+    // Only process if the log level is enabled for at least one output (Serial or MQTT)
     bool shouldLogSerial = (level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE);
     bool shouldLogMqtt = (level <= _mqttLogLevel && _mqttLogLevel != LOG_LEVEL_NONE);
 
@@ -67,22 +69,22 @@ void Logger::log(LogLevel level, const String& tag, const String& message) {
     }
 
     LogEntry entry;
-    // Prefer Unix time if NTP is synced, otherwise use millis()
-    if (time(nullptr) > 1000000000L) { // Basic check if NTP has run
+    // Use Unix time if NTP is synced; otherwise, fallback to millis()
+    if (time(nullptr) > 1000000000L) { // Basic check for NTP sync (valid Unix timestamp)
         entry.timestamp = time(nullptr);
     } else {
-        entry.timestamp = millis(); // Use millis() as a fallback
+        entry.timestamp = millis(); 
     }
     entry.level = level;
     entry.tag = tag;
     entry.message = message;
 
-    processLogEntry(entry); // Send the entry to the common processing function
+    processLogEntry(entry); // Send to common processing function
 }
 
-// Log function with printf-style formatting
+// Logging function with printf-style formatting.
 void Logger::logf(LogLevel level, const String& tag, const char* format, ...) {
-    // Similar to log function, check level first
+    // Check if level is enabled before formatting to save processing
     bool shouldLogSerial = (level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE);
     bool shouldLogMqtt = (level <= _mqttLogLevel && _mqttLogLevel != LOG_LEVEL_NONE);
 
@@ -90,65 +92,65 @@ void Logger::logf(LogLevel level, const String& tag, const char* format, ...) {
         return;
     }
 
-    char buffer[256]; // Buffer for the formatted string, be careful with size
+    char buffer[256]; // Buffer for the formatted string. Ensure it's large enough.
     va_list args;
     va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args); // Format the string
+    vsnprintf(buffer, sizeof(buffer), format, args); 
     va_end(args);
 
-    log(level, tag, String(buffer)); // Call the main log function with the formatted string
+    log(level, tag, String(buffer)); // Call the main log function
 }
 
-// Internal function to handle sending logs to destinations (Serial, MQTT)
+// Internal function to dispatch the log entry to configured destinations (Serial, MQTT).
 void Logger::processLogEntry(const LogEntry& entry) {
     // 1. Log to Serial
-    if (entry.level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE && Serial) { // Check if Serial is ready
-        String logString = String(entry.timestamp) + " [" + levelToString(entry.level) + "]";
-        if (!entry.tag.isEmpty()) {
-            logString += " [" + entry.tag + "]";
+    if (entry.level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE && Serial) { // Check Serial readiness
+        char logBuffer[300]; // Buffer for serial output line
+        int offset = snprintf(logBuffer, sizeof(logBuffer), "%lu [%s]", (unsigned long)entry.timestamp, levelToString(entry.level).c_str());
+        if (!entry.tag.isEmpty() && offset < sizeof(logBuffer)) {
+            offset += snprintf(logBuffer + offset, sizeof(logBuffer) - offset, " [%s]", entry.tag.c_str());
         }
-        logString += ": " + entry.message;
-        Serial.println(logString); // Send to Serial Monitor
+        if (offset < sizeof(logBuffer)) {
+            snprintf(logBuffer + offset, sizeof(logBuffer) - offset, ": %s", entry.message.c_str());
+        }
+        Serial.println(logBuffer); 
     }
 
     // 2. Log via MQTT
     if (entry.level <= _mqttLogLevel && _mqttLogLevel != LOG_LEVEL_NONE) {
         if (_networkManager && _networkManager->isConnected()) {
             String jsonPayload = formatToJson(entry);
-            // NetworkManager::publish should be designed to not block for too long
-            // or have a retry/queue mechanism if high reliability for MQTT logs is needed.
+            // NetworkManager::publish should ideally be non-blocking or handle queueing/retries for critical logs.
             _networkManager->publish(_mqttLogTopic, jsonPayload.c_str());
         }
-        // No else here to avoid loop logging when MQTT is disconnected
+        // No 'else' to avoid recursive logging attempts if MQTT is disconnected.
     }
 }
 
-// Function to convert LogEntry to JSON string for MQTT
+// Converts a LogEntry to a JSON string for MQTT transmission.
 String Logger::formatToJson(const LogEntry& entry) {
-    StaticJsonDocument<512> doc; // JSON size, adjust if more fields are needed
+    StaticJsonDocument<512> doc; // Adjust JSON document size if more fields are added
     
-    // Add API key for authentication
     if (_apiKey != nullptr) {
         doc["api_key"] = _apiKey;
     }
     
     doc["timestamp"] = entry.timestamp;
-    doc["level_num"] = static_cast<int>(entry.level); // Send numeric level
-    doc["level_str"] = levelToString(entry.level);   // and string level for readability
+    doc["level_num"] = static_cast<int>(entry.level); // Numeric level for easier machine processing
+    doc["level_str"] = levelToString(entry.level);   // String level for human readability
     doc["tag"] = entry.tag;
     doc["message"] = entry.message;
     
-    // --- NEW: Add Core ID and Free Heap ---
+    // Add Core ID and Free Heap to provide more context
     doc["core_id"] = xPortGetCoreID();
     doc["free_heap"] = ESP.getFreeHeap();
-    // --- END NEW ---
 
     String output;
-    serializeJson(doc, output); // Convert JSON object to string
+    serializeJson(doc, output); 
     return output;
 }
 
-// Function to convert LogLevel enum to string for display
+// Converts LogLevel enum to its string representation.
 String Logger::levelToString(LogLevel level) {
     switch (level) {
         case LOG_LEVEL_CRITICAL: return "CRITICAL";
@@ -165,17 +167,21 @@ String Logger::levelToString(LogLevel level) {
 void Logger::setSerialLogLevel(LogLevel level) {
     LogLevel oldLevel = _serialLogLevel;
     _serialLogLevel = level;
-    if (Serial && oldLevel != _serialLogLevel) { // Only log if Serial is ready and level changed
-      // Log this message using Serial.println itself to ensure it always appears on change
-      Serial.println(String(millis()) + " [INFO] [Logger]: Serial log level changed from " + levelToString(oldLevel) + " to " + levelToString(_serialLogLevel));
+    if (Serial && oldLevel != _serialLogLevel) { // Log only if Serial is ready and level actually changed
+       // This message is sent directly via Serial.println to ensure it appears during level changes.
+       char logBuffer[150];
+       snprintf(logBuffer, sizeof(logBuffer), "%lu [INFO] [Logger]: Serial log level changed from %s to %s", millis(), levelToString(oldLevel).c_str(), levelToString(_serialLogLevel).c_str());
+       Serial.println(logBuffer);
     }
 }
 
 void Logger::setMqttLogLevel(LogLevel level) {
     LogLevel oldLevel = _mqttLogLevel;
     _mqttLogLevel = level;
-    if (Serial && oldLevel != _mqttLogLevel) { // Only log if Serial is ready and level changed
-      Serial.println(String(millis()) + " [INFO] [Logger]: MQTT log level changed from " + levelToString(oldLevel) + " to " + levelToString(_mqttLogLevel));
+    if (Serial && oldLevel != _mqttLogLevel) { // Log only if Serial is ready and level actually changed
+       char logBuffer[150];
+       snprintf(logBuffer, sizeof(logBuffer), "%lu [INFO] [Logger]: MQTT log level changed from %s to %s", millis(), levelToString(oldLevel).c_str(), levelToString(_mqttLogLevel).c_str());
+       Serial.println(logBuffer);
     }
 }
 
@@ -187,50 +193,55 @@ LogLevel Logger::getMqttLogLevel() const {
     return _mqttLogLevel;
 }
 
-// --- NEW: Performance Logging Function Implementation ---
+// Performance Logging Function
+// Logs performance metrics for specific events.
 void Logger::perf(const String& tag, const String& eventName, unsigned long durationMs, bool success, const String& details) {
-    // Performance logs are typically INFO or DEBUG level. Let's use INFO.
-    // You can make the level a parameter if more flexibility is needed.
+    // Performance logs are treated as INFO level. This can be made configurable if needed.
     LogLevel level = LOG_LEVEL_INFO;
 
     bool shouldLogSerial = (level <= _serialLogLevel && _serialLogLevel != LOG_LEVEL_NONE);
     bool shouldLogMqtt = (level <= _mqttLogLevel && _mqttLogLevel != LOG_LEVEL_NONE);
 
     if (!shouldLogSerial && !shouldLogMqtt) {
-        return; // No target wants to log at this level
+        return; 
     }
 
-    // Create the main message part
-    String perfMessage = "PERF: Event='" + eventName + "', Duration=" + String(durationMs) + "ms, Success=" + (success ? "true" : "false");
-    if (!details.isEmpty()) {
-        perfMessage += ", Details='" + details + "'";
+    // Create the main message part for the performance log
+    char perfMessageBuffer[256]; 
+    int perfMessageOffset = snprintf(perfMessageBuffer, sizeof(perfMessageBuffer), "PERF: Event='%s', Duration=%lums, Success=%s",
+                                   eventName.c_str(), durationMs, success ? "true" : "false");
+    if (!details.isEmpty() && perfMessageOffset < sizeof(perfMessageBuffer)) {
+        snprintf(perfMessageBuffer + perfMessageOffset, sizeof(perfMessageBuffer) - perfMessageOffset, ", Details='%s'", details.c_str());
     }
 
-    // For Serial, just print the composed message
+    // Log to Serial (if enabled for INFO level)
     if (shouldLogSerial && Serial) {
-        LogEntry entry;
+        LogEntry entry; // Temporary LogEntry for Serial output context
         if (time(nullptr) > 1000000000L) {
             entry.timestamp = time(nullptr);
         } else {
             entry.timestamp = millis();
         }
         entry.level = level;
-        entry.tag = tag; // Use the provided tag
-        entry.message = perfMessage;
+        entry.tag = tag;
+        entry.message = perfMessageBuffer; // The pre-formatted performance message
 
-        // Directly format for serial to include core_id and free_heap contextually for this specific log
-        String logString = String(entry.timestamp) + " [" + levelToString(entry.level) + "]";
-        logString += " [" + entry.tag + "]";
-        logString += " [Core:" + String(xPortGetCoreID()) + ", Heap:" + String(ESP.getFreeHeap()) + "]"; // Add context here too
-        logString += ": " + entry.message;
-        Serial.println(logString);
+        // Format specifically for serial, including core ID and heap for this log line
+        char serialLogBuffer[350]; 
+        int serialOffset = snprintf(serialLogBuffer, sizeof(serialLogBuffer), "%lu [%s] [%s] [Core:%d, Heap:%u]: %s",
+                                (unsigned long)entry.timestamp,
+                                levelToString(entry.level).c_str(),
+                                entry.tag.c_str(),
+                                (int)xPortGetCoreID(),
+                                ESP.getFreeHeap(),
+                                entry.message.c_str()); 
+        Serial.println(serialLogBuffer);
     }
 
-    // For MQTT, create a structured JSON payload
+    // Log to MQTT (if enabled for INFO level and network is connected)
     if (shouldLogMqtt && _networkManager && _networkManager->isConnected()) {
-        StaticJsonDocument<512> doc; // Adjust size as needed
+        StaticJsonDocument<512> doc; // JSON document for MQTT payload
         
-        // Add API key for authentication
         if (_apiKey != nullptr) {
             doc["api_key"] = _apiKey;
         }
@@ -241,9 +252,9 @@ void Logger::perf(const String& tag, const String& eventName, unsigned long dura
             doc["timestamp"] = millis();
         }
         doc["level_num"] = static_cast<int>(level);
-        doc["level_str"] = levelToString(level); // Or a dedicated "PERF" level string
+        doc["level_str"] = levelToString(level); 
         doc["tag"] = tag;
-        // Differentiate performance logs, e.g., by adding a "type" field or specific structure
+        // Structure for performance event data
         doc["type"] = "performance";
         doc["event_name"] = eventName;
         doc["duration_ms"] = durationMs;
@@ -256,8 +267,8 @@ void Logger::perf(const String& tag, const String& eventName, unsigned long dura
 
         String mqttPayload;
         serializeJson(doc, mqttPayload);
-        _networkManager->publish(_mqttLogTopic, mqttPayload.c_str()); // Assuming _mqttLogTopic is your general log topic
-                                                                    // Consider a dedicated topic for performance logs if volume is high.
+        _networkManager->publish(_mqttLogTopic, mqttPayload.c_str()); 
+        // Consider a dedicated MQTT topic for performance logs if their volume is high
+        // or if they need different downstream processing.
     }
-}
-// --- END NEW --- 
+} 

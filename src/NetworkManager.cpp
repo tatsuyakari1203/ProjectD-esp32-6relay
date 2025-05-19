@@ -1,7 +1,7 @@
 #include "../include/NetworkManager.h"
 #include "../include/Logger.h"
 
-NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) { // 7 hours offset for Vietnam
+NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) { // GMT+7 for Vietnam
     _wifiConnected = false;
     _mqttConnected = false;
     _timeSync = false;
@@ -17,12 +17,12 @@ NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600
     _isAttemptingWifiReconnect = false;
     _isAttemptingMqttReconnect = false;
 
-    // Create random clientId with timestamp for uniqueness
+    // Generate a unique MQTT client ID using part of MAC address and timestamp
     uint32_t random_id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
     uint32_t timestamp = millis();
     snprintf(_clientId, sizeof(_clientId), "ESP32Client-%06X-%u", random_id, timestamp % 1000000);
     
-    // This will use Serial directly since AppLogger is not yet initialized
+    // Initial log, AppLogger might not be fully set up yet
     Serial.println("Generated MQTT Client ID: " + String(_clientId));
 }
 
@@ -34,7 +34,7 @@ bool NetworkManager::begin(const char* ssid, const char* password, const char* m
 
     AppLogger.info("NetMgr", "Initializing network connection...");
     if (_connectWifi()) {
-        // Initialize NTP client and synchronize time after WiFi connected
+        // Initialize NTP client and synchronize time now that WiFi is available
         _timeClient.begin();
         if (syncTime()) {
             AppLogger.info("NetMgr", "Time synchronized via NTP.");
@@ -43,7 +43,7 @@ bool NetworkManager::begin(const char* ssid, const char* password, const char* m
             AppLogger.warning("NetMgr", "Time sync failed via NTP.");
         }
         
-        // Initialize MQTT client
+        // Initialize MQTT client settings
         _mqttClient.setClient(_wifiClient);
         _mqttClient.setServer(_mqttServer, _mqttPort);
         _mqttClient.setKeepAlive(60);
@@ -55,16 +55,16 @@ bool NetworkManager::begin(const char* ssid, const char* password, const char* m
             return true;
         }
         AppLogger.error("NetMgr", "Initial MQTT connection failed.");
-        _handleMqttDisconnect(); // Start MQTT reconnection process
-        return false; // MQTT failed initially, but WiFi is up
+        _handleMqttDisconnect(); // Initiate MQTT reconnection process
+        return false; // MQTT failed, but WiFi is up; allow operation in a degraded state or rely on reconnect logic
     }
     AppLogger.error("NetMgr", "Initial WiFi connection failed.");
-    _handleWifiDisconnect(); // Start WiFi reconnection process
+    _handleWifiDisconnect(); // Initiate WiFi reconnection process
     return false;
 }
 
 bool NetworkManager::_connectWifi() {
-    AppLogger.info("NetMgr", "Connecting to WiFi SSID: " + String(_ssid));
+    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Connecting to WiFi SSID: %s", _ssid);
     _isAttemptingWifiReconnect = true;
     WiFi.begin(_ssid, _password);
     
@@ -72,7 +72,7 @@ bool NetworkManager::_connectWifi() {
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - startTime > WIFI_CONNECT_TIMEOUT_MS) {
             AppLogger.error("NetMgr", "WiFi connection timed out.");
-            WiFi.disconnect(true); // Ensure it's fully disconnected
+            WiFi.disconnect(true); // Ensure proper disconnection
             _isAttemptingWifiReconnect = false;
             _wifiConnected = false;
             return false;
@@ -82,11 +82,11 @@ bool NetworkManager::_connectWifi() {
     }
     
     Serial.println();
-    AppLogger.info("NetMgr", "WiFi connected. IP: " + WiFi.localIP().toString());
+    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "WiFi connected. IP: %s", WiFi.localIP().toString().c_str());
     _wifiConnected = true;
     _isAttemptingWifiReconnect = false;
-    _wifiRetryCount = 0; // Reset retry count on successful connection
-    _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS; // Reset interval
+    _wifiRetryCount = 0; // Reset retry counters on successful connection
+    _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS; 
     return true;
 }
 
@@ -95,7 +95,7 @@ bool NetworkManager::_connectMqtt() {
         AppLogger.warning("NetMgr", "Cannot connect MQTT, WiFi is not connected.");
         return false;
     }
-    AppLogger.info("NetMgr", "Attempting MQTT connection to " + String(_mqttServer) + ":" + String(_mqttPort));
+    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Attempting MQTT connection to %s:%d", _mqttServer, _mqttPort);
     _isAttemptingMqttReconnect = true;
     bool connected = _mqttClient.connect(_clientId);
     
@@ -103,13 +103,13 @@ bool NetworkManager::_connectMqtt() {
         AppLogger.info("NetMgr", "MQTT connected.");
         _mqttConnected = true;
         _isAttemptingMqttReconnect = false;
-        _mqttRetryCount = 0; // Reset retry count
-        _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS; // Reset interval
-        _executeMqttSubscriptions();
+        _mqttRetryCount = 0; // Reset retry counters
+        _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS; 
+        _executeMqttSubscriptions(); // Subscribe to all registered topics
     } else {
-        AppLogger.warning("NetMgr", "MQTT connection failed, rc=" + String(_mqttClient.state()));
-        _mqttConnected = false; // Ensure this is set if connect fails
-        // _isAttemptingMqttReconnect remains true if it failed, loop will handle next attempt
+        AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "MQTT connection failed, rc=%d", _mqttClient.state());
+        _mqttConnected = false; 
+        // _isAttemptingMqttReconnect remains true, allowing loop() to handle next attempt
     }
     return connected;
 }
@@ -122,9 +122,9 @@ void NetworkManager::_executeMqttSubscriptions() {
     AppLogger.info("NetMgr", "Executing MQTT subscriptions...");
     for (const String& topic : _subscriptionTopics) {
         if (_mqttClient.subscribe(topic.c_str())) {
-            AppLogger.info("NetMgr", "Successfully subscribed to: " + topic);
+            AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Successfully subscribed to: %s", topic.c_str());
         } else {
-            AppLogger.error("NetMgr", "Failed to subscribe to: " + topic);
+            AppLogger.logf(LOG_LEVEL_ERROR, "NetMgr", "Failed to subscribe to: %s", topic.c_str());
         }
     }
 }
@@ -132,117 +132,117 @@ void NetworkManager::_executeMqttSubscriptions() {
 void NetworkManager::_handleWifiDisconnect() {
     AppLogger.warning("NetMgr", "WiFi disconnected. Initiating reconnection process.");
     _wifiConnected = false;
-    _mqttConnected = false; // MQTT can't be connected if WiFi is down
+    _mqttConnected = false; // MQTT cannot be connected if WiFi is down
     _isAttemptingWifiReconnect = true;
-    _isAttemptingMqttReconnect = false; // Stop MQTT attempts if WiFi is down
-    _nextWifiRetryTime = millis() + _currentWifiRetryIntervalMs; // Schedule next attempt
+    _isAttemptingMqttReconnect = false; // Halt MQTT reconnection attempts if WiFi is down
+    _nextWifiRetryTime = millis() + _currentWifiRetryIntervalMs; 
 }
 
 void NetworkManager::_handleMqttDisconnect() {
-    if (!_wifiConnected) { // If WiFi is also down, WiFi handler takes precedence
-        _isAttemptingMqttReconnect = false;
+    if (!_wifiConnected) { // If WiFi is also down, WiFi disconnection handler takes precedence
+        _isAttemptingMqttReconnect = false; // No need to attempt MQTT if WiFi is not up
         return;
     }
     AppLogger.warning("NetMgr", "MQTT disconnected. Initiating reconnection process.");
     _mqttConnected = false;
     _isAttemptingMqttReconnect = true;
-    _nextMqttRetryTime = millis() + _currentMqttRetryIntervalMs; // Schedule next attempt
+    _nextMqttRetryTime = millis() + _currentMqttRetryIntervalMs; 
 }
 
 void NetworkManager::loop() {
     unsigned long currentTime = millis();
 
-    // 1. WiFi Connection Management
+    // --- WiFi Connection Management ---
     if (!_wifiConnected && _isAttemptingWifiReconnect) {
         if (currentTime >= _nextWifiRetryTime) {
             if (_wifiRetryCount < MAX_WIFI_RETRY_ATTEMPTS) {
-                AppLogger.info("NetMgr", "Retrying WiFi connection (Attempt " + String(_wifiRetryCount + 1) + ")...");
+                AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Retrying WiFi connection (Attempt %d)...", _wifiRetryCount + 1);
                 if (_connectWifi()) {
-                    // WiFi reconnected, now try to connect MQTT
-                    _isAttemptingMqttReconnect = true; // Signal to attempt MQTT connection
-                    _nextMqttRetryTime = millis(); // Attempt MQTT immediately
-                    _mqttRetryCount = 0; // Reset MQTT retries as WiFi is now up
+                    // WiFi reconnected successfully
+                    _isAttemptingMqttReconnect = true; // Signal to attempt MQTT connection next
+                    _nextMqttRetryTime = millis();     // Attempt MQTT immediately
+                    _mqttRetryCount = 0;               // Reset MQTT retries as WiFi is newly up
                     _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
                 } else {
                     _wifiRetryCount++;
-                    _currentWifiRetryIntervalMs = min(MAX_RETRY_INTERVAL_MS, _currentWifiRetryIntervalMs * 2); // Exponential backoff
+                    _currentWifiRetryIntervalMs = min(MAX_RETRY_INTERVAL_MS, _currentWifiRetryIntervalMs * 2); // Apply exponential backoff
                     _nextWifiRetryTime = currentTime + _currentWifiRetryIntervalMs;
-                    AppLogger.warning("NetMgr", "WiFi retry failed. Next attempt in " + String(_currentWifiRetryIntervalMs / 1000) + "s.");
+                    AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "WiFi retry failed. Next attempt in %lus.", _currentWifiRetryIntervalMs / 1000);
                 }
             } else {
-                AppLogger.error("NetMgr", "Max WiFi retry attempts reached. Will try again later.");
-                _nextWifiRetryTime = currentTime + MAX_RETRY_INTERVAL_MS * 2; // Wait longer before resetting cycle
-                _wifiRetryCount = 0; // Reset to try the cycle again later
+                AppLogger.error("NetMgr", "Max WiFi retry attempts reached. Pausing before restarting cycle.");
+                _nextWifiRetryTime = currentTime + MAX_RETRY_INTERVAL_MS * 2; // Wait longer before restarting the retry cycle
+                _wifiRetryCount = 0; // Reset to allow a new cycle of attempts later
                 _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
             }
         }
     } else if (WiFi.status() != WL_CONNECTED && _wifiConnected) {
-        // WiFi was connected, but now it's not (e.g. router rebooted)
+        // WiFi was previously connected, but has now dropped
         _handleWifiDisconnect();
     }
 
-    // 2. MQTT Connection Management (only if WiFi is connected)
+    // --- MQTT Connection Management (only if WiFi is connected) ---
     if (_wifiConnected) {
         if (!_mqttClient.connected() && _isAttemptingMqttReconnect) {
             if (currentTime >= _nextMqttRetryTime) {
                 if (_mqttRetryCount < MAX_MQTT_RETRY_ATTEMPTS) {
-                    AppLogger.info("NetMgr", "Retrying MQTT connection (Attempt " + String(_mqttRetryCount + 1) + ")...");
+                    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Retrying MQTT connection (Attempt %d)...", _mqttRetryCount + 1);
                     if (_connectMqtt()) {
-                        // MQTT reconnected successfully
+                        // MQTT reconnected successfully, _connectMqtt handles flag updates
                     } else {
                         _mqttRetryCount++;
-                        _currentMqttRetryIntervalMs = min(MAX_RETRY_INTERVAL_MS, _currentMqttRetryIntervalMs * 2); // Exponential backoff
+                        _currentMqttRetryIntervalMs = min(MAX_RETRY_INTERVAL_MS, _currentMqttRetryIntervalMs * 2); // Apply exponential backoff
                         _nextMqttRetryTime = currentTime + _currentMqttRetryIntervalMs;
-                        AppLogger.warning("NetMgr", "MQTT retry failed. Next attempt in " + String(_currentMqttRetryIntervalMs / 1000) + "s.");
+                        AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "MQTT retry failed. Next attempt in %lus.", _currentMqttRetryIntervalMs / 1000);
                     }
                 } else {
-                    AppLogger.error("NetMgr", "Max MQTT retry attempts reached. Will try again later if WiFi is up.");
+                    AppLogger.error("NetMgr", "Max MQTT retry attempts reached. Pausing before restarting cycle.");
                     _nextMqttRetryTime = currentTime + MAX_RETRY_INTERVAL_MS * 2; // Wait longer
-                    _mqttRetryCount = 0; // Reset to try cycle again
+                    _mqttRetryCount = 0; // Reset to allow a new cycle of attempts later
                     _currentMqttRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
                 }
             }
         } else if (_mqttClient.connected()) {
-            _mqttClient.loop(); // Essential for PubSubClient to process messages and keepalive
-        } else if (!_mqttClient.connected() && _mqttConnected) { // MQTT was connected, but now it's not
+            _mqttClient.loop(); // Crucial for PubSubClient: processes incoming messages and maintains keepalive
+        } else if (!_mqttClient.connected() && _mqttConnected) { // MQTT was previously connected, but has now dropped
              _handleMqttDisconnect();
         }
     }
 
-    // 3. NTP Time Sync Update (periodically)
-    // _timeClient.update(); // This is typically non-blocking
-    // syncTime() might be better called less frequently if it's blocking or after connections are stable.
-    // For now, assuming periodic update is fine for NTPClient.
+    // --- NTP Time Sync Update (periodically if connected and synced initially) ---
+    // _timeClient.update() is generally non-blocking. Called periodically to maintain time accuracy.
     if(_wifiConnected && _timeSync) _timeClient.update();
 }
 
 bool NetworkManager::publish(const char* topic, const char* payload) {
     if (!isConnected()) {
-        AppLogger.warning("NetMgr", "Cannot publish, network not fully connected. Topic: " + String(topic));
+        AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "Cannot publish, network not fully connected. Topic: %s", topic);
         return false;
     }
-    AppLogger.debug("NetMgr", "Publishing to MQTT topic: " + String(topic) + ", length: " + String(strlen(payload)));
+    AppLogger.logf(LOG_LEVEL_DEBUG, "NetMgr", "Publishing to MQTT topic: %s, length: %u", topic, strlen(payload));
     return _mqttClient.publish(topic, payload);
 }
 
+// Adds a topic to the subscription list and subscribes if currently connected.
+// Topics in the list will be automatically re-subscribed upon MQTT (re)connection.
 bool NetworkManager::subscribe(const char* topic) {
     if (topic == nullptr || strlen(topic) == 0) return false;
-    // Add to list for resubscription on reconnect
+    
     for (const String& existingTopic : _subscriptionTopics) {
         if (existingTopic.equals(topic)) {
-            // AppLogger.debug("NetMgr", "Topic already in subscription list: " + String(topic));
-            // Still attempt to subscribe if MQTT is connected, in case initial subscribe failed
+            // Topic is already in the list. 
+            // If connected, re-subscribing might be redundant but harmless if initial subscribe failed.
             if (_mqttClient.connected()) {
                 return _mqttClient.subscribe(topic);
             }
-            return false; // Not connected, will be subscribed on connect
+            return true; // Already listed, will be subscribed on connect.
         }
     }
     _subscriptionTopics.push_back(String(topic));
-    AppLogger.info("NetMgr", "Added to subscription list: " + String(topic));
+    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Added to subscription list: %s", topic);
 
     if (_mqttClient.connected()) {
-        AppLogger.debug("NetMgr", "Attempting to subscribe immediately: " + String(topic));
+        AppLogger.logf(LOG_LEVEL_DEBUG, "NetMgr", "Attempting to subscribe immediately: %s", topic);
         return _mqttClient.subscribe(topic);
     }
     return true; // Added to list, will be subscribed when MQTT connects
@@ -268,29 +268,27 @@ bool NetworkManager::syncTime() {
     }
     AppLogger.info("NetMgr", "Attempting NTP time synchronization...");
     int retries = 0;
-    // _timeClient.update() can be true even if time is not synced yet after boot
-    // _timeClient.forceUpdate() is blocking
-    // Using getEpochTime to check if time is reasonable
-    _timeClient.begin(); // Ensure it's started
+    // Ensure NTP client is started. _timeClient.update() can return true even if time isn't yet valid after boot.
+    // _timeClient.forceUpdate() is blocking. We check time(nullptr) for a reasonable Unix timestamp.
+    _timeClient.begin(); 
 
-    while(time(nullptr) < 1000000000L && retries < 5) { // Check if time looks like a Unix timestamp
-        _timeClient.forceUpdate();
-        AppLogger.debug("NetMgr", "NTP forceUpdate, current epoch: " + String(time(nullptr)));
-        delay(1000); 
+    while(time(nullptr) < 1000000000L && retries < 5) { // Check if time is a plausible Unix epoch time
+        _timeClient.forceUpdate(); // Blocking call to fetch time
+        AppLogger.logf(LOG_LEVEL_DEBUG, "NetMgr", "NTP forceUpdate, current epoch: %lu", (unsigned long)time(nullptr));
+        delay(1000); // Wait for network and NTP response
         retries++;
     }
 
-    if (time(nullptr) > 1000000000L) {
-        // configTime and tzset are important for Arduino time functions like localtime()
-        // configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3)
-        // For Vietnam GMT+7, gmtOffset_sec = 7 * 3600 = 25200. daylightOffset_sec = 0.
+    if (time(nullptr) > 1000000000L) { // Check if time is now valid
+        // Configure system time using NTP data and set the timezone.
+        // For Vietnam (GMT+7), gmtOffset_sec = 7 * 3600 = 25200. daylightOffset_sec = 0.
         configTime(7 * 3600, 0, "pool.ntp.org"); 
-        setenv("TZ", "Asia/Ho_Chi_Minh", 1); // Set timezone environment variable
-        tzset(); // Apply an C library timezone change
+        setenv("TZ", "Asia/Ho_Chi_Minh", 1); // Set TimeZone environment variable
+        tzset(); // Apply C library timezone change based on TZ variable
         AppLogger.info("NetMgr", "NTP time synchronized and timezone set.");
         struct tm timeinfo;
         getLocalTime(&timeinfo);
-        AppLogger.info("NetMgr", "Current time: " + String(asctime(&timeinfo)));
+        AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Current time: %s", asctime(&timeinfo));
         _timeSync = true;
         return true;
     }

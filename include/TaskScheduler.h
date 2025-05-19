@@ -100,9 +100,9 @@ private:
     void checkTasks();                       // Kiểm tra lịch đến giờ
     void startTask(IrrigationTask& task);    // Bắt đầu lịch tưới
     void stopTask(IrrigationTask& task);     // Dừng lịch tưới
-    bool isHigherPriority(int taskId);       // Kiểm tra độ ưu tiên
+    bool isHigherPriority(int checkingTaskId, uint8_t conflictingZoneId);       // Kiểm tra độ ưu tiên
     bool isZoneBusy(uint8_t zoneId);         // Kiểm tra vùng có đang chạy
-    time_t calculateNextRunTime(IrrigationTask& task); // Tính giờ chạy kế tiếp
+    time_t calculateNextRunTime(IrrigationTask& task, bool isRescheduleAfterSkip = false); // Tính giờ chạy kế tiếp
     bool checkSensorConditions(const IrrigationTask& task); // Kiểm tra điều kiện cảm biến
     uint8_t daysArrayToBitmap(JsonArray daysArray); // Chuyển mảng ngày sang bitmap
     JsonArray bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap); // Chuyển bitmap sang mảng ngày

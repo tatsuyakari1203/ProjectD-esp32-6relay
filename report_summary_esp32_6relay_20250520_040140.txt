@@ -1,0 +1,55 @@
+--- MQTT Relay Performance Summary (esp32_6relay) ---
+Report generated on: 2025-05-20 04:01:40
+
+=== Overall Performance ===
+Total Commands Sent: 600
+Successful Responses: 600
+Timeouts: 0
+Overall Success Rate: 100.00%
+
+Overall Latency (for successful responses):
+  Average: 109.61 ms
+  Median: 111.34 ms
+  Min: 50.12 ms
+  Max: 419.06 ms
+  95th Percentile: 150.98 ms
+
+=== Per Relay Summary ===
+
+Relay ID: 1
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 111.79 ms (80 cmds)
+    Avg Latency (no change cmd): 100.93 ms (20 cmds)
+
+Relay ID: 2
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 112.09 ms (53 cmds)
+    Avg Latency (no change cmd): 106.83 ms (47 cmds)
+
+Relay ID: 3
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 110.73 ms (80 cmds)
+    Avg Latency (no change cmd): 105.17 ms (20 cmds)
+
+Relay ID: 4
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 109.97 ms (61 cmds)
+    Avg Latency (no change cmd): 109.05 ms (39 cmds)
+
+Relay ID: 5
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 110.15 ms (80 cmds)
+    Avg Latency (no change cmd): 107.47 ms (20 cmds)
+
+Relay ID: 6
+  Success Rate: 100.00% (100/100 commands)
+  Average Latency: 109.61 ms
+    Avg Latency (state change cmd): 112.91 ms (56 cmds)
+    Avg Latency (no change cmd): 105.42 ms (44 cmds)
+
+--- End of Report ---

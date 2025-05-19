@@ -9,25 +9,26 @@ EnvironmentManager::EnvironmentManager(SensorManager& sensorManager) : _sensorMa
     _lightLevel = 0;
     _lastUpdateTime = 0;
     
-    // Thiết lập giá trị mặc định cho độ ẩm đất (50% - giá trị trung bình)
+    // Initialize soil moisture to a default value (e.g., 50%) for all zones.
     for (int i = 1; i <= 6; i++) {
         _soilMoisture[i] = 50.0;
     }
 }
 
+// The update() method is currently rate-limited but does not perform active sensor reading itself.
+// Temperature, humidity, and heat index are updated externally via setters (e.g., from main.cpp after SensorManager reads them).
+// This method can be expanded to include other environment processing logic if needed.
 void EnvironmentManager::update() {
     unsigned long currentTime = millis();
     
-    // Giới hạn tần suất cập nhật (mỗi 1 giây)
+    // Limit update frequency (e.g., once per second)
     if (currentTime - _lastUpdateTime < 1000) {
         return;
     }
     _lastUpdateTime = currentTime;
     
-    // KHÔNG đọc nhiệt độ, độ ẩm từ SensorManager ở đây nữa
-    // Dữ liệu nhiệt độ, độ ẩm, chỉ số nhiệt từ DHT sẽ được đẩy từ main.cpp
-    
-    // Các cảm biến khác hoặc logic xử lý khác có thể được thêm vào đây
+    // Temperature, humidity, and heat index data from DHT sensors are pushed from main.cpp via setters.
+    // Other sensor processing or logic can be added here.
 }
 
 float EnvironmentManager::getTemperature() {
@@ -43,13 +44,14 @@ float EnvironmentManager::getHeatIndex() {
 }
 
 float EnvironmentManager::getSoilMoisture(int zone) {
-    // Kiểm tra xem zone có trong map không
+    // Check if the zone exists in the map.
     if (_soilMoisture.find(zone) != _soilMoisture.end()) {
         return _soilMoisture[zone];
     }
     
-    // Trả về giá trị mặc định nếu không tìm thấy zone
-    return 50.0;
+    // Return a default value if the zone is not found.
+    AppLogger.logf(LOG_LEVEL_WARNING, "EnvMgr", "Requested soil moisture for invalid zone %d, returning default.", zone);
+    return 50.0; // Default value
 }
 
 bool EnvironmentManager::isRaining() {
@@ -60,33 +62,36 @@ int EnvironmentManager::getLightLevel() {
     return _lightLevel;
 }
 
-// Setter cho nhiệt độ từ bên ngoài
+// Setter for temperature, typically called from outside after sensor read.
 void EnvironmentManager::setCurrentTemperature(float temp) {
     _temperature = temp;
 }
 
-// Setter cho độ ẩm từ bên ngoài
+// Setter for humidity, typically called from outside after sensor read.
 void EnvironmentManager::setCurrentHumidity(float hum) {
     _humidity = hum;
 }
 
-// Setter cho chỉ số nhiệt từ bên ngoài
+// Setter for heat index, typically called from outside after sensor read.
 void EnvironmentManager::setCurrentHeatIndex(float hi) {
     _heatIndex = hi;
 }
 
+// Sets the soil moisture for a specific zone.
 void EnvironmentManager::setSoilMoisture(int zone, float value) {
-    if (zone >= 1 && zone <= 6) {
+    if (zone >= 1 && zone <= 6) { // Assuming 6 zones max, adjust if necessary
         _soilMoisture[zone] = value;
         AppLogger.info("EnvMgr", "Set soil moisture for zone " + String(zone) + " to " + String(value) + "%");
     }
 }
 
+// Sets the current rain status.
 void EnvironmentManager::setRainStatus(bool isRaining) {
     _isRaining = isRaining;
     AppLogger.info("EnvMgr", "Set rain status to " + String(isRaining ? "raining" : "not raining"));
 }
 
+// Sets the current light level.
 void EnvironmentManager::setLightLevel(int level) {
     _lightLevel = level;
     AppLogger.info("EnvMgr", "Set light level to " + String(level) + " lux");

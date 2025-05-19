@@ -52,6 +52,8 @@ public:
     // Kiểm tra xem trạng thái có thay đổi không và reset cờ
     bool hasStatusChangedAndReset();
 
+    int getNumRelays() const; // Added to get the number of relays
+
     // Hàm callback cho software timer (phải là static hoặc global nếu không dùng mẹo)
     static void relayTimerCallback(TimerHandle_t xTimer);
     

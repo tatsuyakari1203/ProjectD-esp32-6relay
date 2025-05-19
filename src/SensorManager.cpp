@@ -10,37 +10,38 @@ SensorManager::SensorManager() : _dht(DHT_PIN, DHT_TYPE) {
 }
 
 void SensorManager::begin() {
-    _dht.begin();
+    _dht.begin(); // Initialize the DHT sensor library
     AppLogger.info("SensorMgr", "DHT21 sensor initialized");
 }
 
+// Reads sensor data if the _readInterval has elapsed since the last read.
+// Returns true if the read was successful in the current call or the previous successful read is still valid.
+// Returns false if a new read attempt failed.
 bool SensorManager::readSensors() {
     unsigned long currentTime = millis();
     
-    // Only read the sensor if _readInterval time has passed
+    // Only read from the sensor if _readInterval has passed to avoid overwhelming it.
     if (currentTime - _lastReadTime >= _readInterval) {
         _lastReadTime = currentTime;
         
-        // Read humidity
         _humidity = _dht.readHumidity();
+        _temperature = _dht.readTemperature(); // Celsius by default
         
-        // Read temperature (in Celsius)
-        _temperature = _dht.readTemperature();
-        
-        // Check if any reading failed
+        // Check if any reading failed (isnan is for float Not-a-Number)
         if (isnan(_humidity) || isnan(_temperature)) {
             AppLogger.error("SensorMgr", "Failed to read from DHT sensor!");
-            _readSuccess = false;
+            _readSuccess = false; // Mark current read attempt as failed
             return false;
         }
         
-        // Calculate heat index
-        _heatIndex = _dht.computeHeatIndex(_temperature, _humidity, false);
+        // Calculate heat index (in Celsius)
+        _heatIndex = _dht.computeHeatIndex(_temperature, _humidity, false); // false for Celsius
         
-        _readSuccess = true;
+        _readSuccess = true; // Mark current read attempt as successful
         return true;
     }
     
+    // If interval hasn't passed, return status of the last read attempt
     return _readSuccess;
 }
 
@@ -56,45 +57,38 @@ float SensorManager::getHeatIndex() {
     return _heatIndex;
 }
 
+// Generates a JSON payload string with sensor data.
 String SensorManager::getJsonPayload(const char* apiKey) {
-    // Get current timestamp
     time_t now;
-    time(&now);
+    time(&now); // Get current Unix timestamp
     
-    // Create JSON document with appropriate size
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<512> doc; // Adjust size if payload structure changes
     
-    // Add required fields
     doc["api_key"] = apiKey;
-    doc["timestamp"] = (double)now;
+    doc["timestamp"] = (double)now; // Using double for timestamp as per some conventions
     
-    // Create device_info object
     JsonObject device_info = doc.createNestedObject("device_info");
-    device_info["name"] = "esp32_6relay";
-    device_info["type"] = "DHT21";
-    device_info["firmware"] = "1.0.0";
+    device_info["name"] = "esp32_6relay"; // Device identifier
+    device_info["type"] = "DHT21";        // Sensor type
+    device_info["firmware"] = "1.0.0";    // Firmware version
     
-    // Create temperature object
     JsonObject temp = doc.createNestedObject("temperature");
     temp["value"] = _temperature;
     temp["unit"] = "celsius";
     temp["sensor_type"] = "temperature";
     
-    // Create humidity object
     JsonObject humidity = doc.createNestedObject("humidity");
     humidity["value"] = _humidity;
     humidity["unit"] = "percent";
     humidity["sensor_type"] = "humidity";
     
-    // Create heat index object
     JsonObject heat_index = doc.createNestedObject("heat_index");
     heat_index["value"] = _heatIndex;
     heat_index["unit"] = "celsius";
     heat_index["sensor_type"] = "heat_index";
     
-    // Convert JSON document to string
     String payload;
-    serializeJson(doc, payload);
+    serializeJson(doc, payload); // Serialize JSON document to string
     
     return payload;
 } 

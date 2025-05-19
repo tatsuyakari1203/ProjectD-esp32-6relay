@@ -12,7 +12,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"    
 
-// THÊM VÀO: Hằng số cho JSON keys
+// JSON keys for MQTT payloads
 static const char* JSON_KEY_SOIL_MOISTURE = "soil_moisture";
 static const char* JSON_KEY_ZONE = "zone";
 static const char* JSON_KEY_VALUE = "value";
@@ -35,8 +35,8 @@ void printLocalTime();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // Core task definitions
-TaskHandle_t core0Task;  // Preemptive tasks: sensors, MQTT, scheduling
-TaskHandle_t core1Task;  // Non-preemptive tasks: irrigation control
+TaskHandle_t core0Task;  // Handles sensors, MQTT, scheduling (preemptive)
+TaskHandle_t core1Task;  // Handles irrigation control events (event-driven)
 
 // Priority levels (higher number = higher priority)
 #define PRIORITY_LOW 1
@@ -61,13 +61,13 @@ const int relayPins[] = {
 const int numRelays = 6;
 
 // WiFi and MQTT configuration
-const char* WIFI_SSID = "2.4 KariS";  // Replace with your WiFi name
-const char* WIFI_PASSWORD = "12123402";  // Replace with your WiFi password
+const char* WIFI_SSID = "2.4 KariS";  // TODO: Replace with your WiFi name
+const char* WIFI_PASSWORD = "12123402";  // TODO: Replace with your WiFi password
 const char* MQTT_SERVER = "karis.cloud";
 const int MQTT_PORT = 1883;
 const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";  // Provided API key
 
-// MQTT topic configuration
+// MQTT topics
 const char* MQTT_TOPIC_SENSORS = "irrigation/esp32_6relay/sensors";
 const char* MQTT_TOPIC_CONTROL = "irrigation/esp32_6relay/control";
 const char* MQTT_TOPIC_STATUS = "irrigation/esp32_6relay/status";
@@ -75,7 +75,7 @@ const char* MQTT_TOPIC_SCHEDULE = "irrigation/esp32_6relay/schedule";
 const char* MQTT_TOPIC_SCHEDULE_STATUS = "irrigation/esp32_6relay/schedule/status";
 const char* MQTT_TOPIC_ENV_CONTROL = "irrigation/esp32_6relay/environment";
 
-// Add a new MQTT topic for log configuration
+// MQTT topic for log configuration
 const char* MQTT_TOPIC_LOG_CONFIG = "irrigation/esp32_6relay/logconfig";
 
 // NTP configuration
@@ -94,8 +94,8 @@ unsigned long lastSensorReadTime = 0;
 const unsigned long sensorReadInterval = 30000;  // Read sensors and send data every 30 seconds
 unsigned long lastForcedStatusReportTime = 0;
 const unsigned long forcedStatusReportInterval = 5 * 60 * 1000;  // Force status update every 5 minutes
-unsigned long lastEnvUpdateTime = 0;
-const unsigned long envUpdateInterval = 2000;  // Update environment readings every 2 seconds
+unsigned long lastEnvUpdateTime = 0; // Not currently used, consider for future environment polling logic
+const unsigned long envUpdateInterval = 2000;  // Intended interval for environment updates
 
 // LED status tracking
 bool ledState = false;
@@ -105,7 +105,7 @@ const unsigned long ledBlinkInterval = 1000;  // Blink LED every 1 second
 // Semaphores for safe access to shared resources
 SemaphoreHandle_t sensorDataMutex;
 
-// Khai báo QueueHandle_t toàn cục cho sự kiện Relay Timer
+// Queue for relay timer events
 QueueHandle_t g_relayEventQueue; 
 
 // Function to display current time
@@ -118,9 +118,7 @@ void printLocalTime() {
   
   char timeString[50];
   strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  AppLogger.info("Time", "Current time: " + String(timeString) + 
-                ", Timezone: " + String(TZ_INFO) + 
-                " (Day of week: " + String(timeinfo.tm_wday) + ")");
+  AppLogger.logf(LOG_LEVEL_INFO, "Time", "Current time: %s, Timezone: %s (Day of week: %d)", timeString, TZ_INFO, timeinfo.tm_wday);
 }
 
 // MQTT callback function
@@ -130,25 +128,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(message, payload, length);
   message[length] = '\0';
   
-  AppLogger.debug("MQTTCallbk", "Received MQTT message on topic: " + String(topic));
-  AppLogger.debug("MQTTCallbk", "Payload: " + String(message));
+  AppLogger.logf(LOG_LEVEL_DEBUG, "MQTTCallbk", "Received MQTT message on topic: %s", topic);
+  AppLogger.logf(LOG_LEVEL_DEBUG, "MQTTCallbk", "Payload: %s", message);
   
   // Process message based on topic
   if (strcmp(topic, MQTT_TOPIC_CONTROL) == 0) {
-    // Process relay control command - không publish ngay, để do phát hiện thay đổi
+    // Relay control commands are processed by RelayManager.
+    // Status changes are detected and published by Core0Task.
     relayManager.processCommand(message);
   }
   else if (strcmp(topic, MQTT_TOPIC_SCHEDULE) == 0) {
-    // Process scheduling command - không publish ngay, để do phát hiện thay đổi
+    // Schedule commands are processed by TaskScheduler.
+    // Status changes are detected and published by Core0Task.
     taskScheduler.processCommand(message);
   }
   else if (strcmp(topic, MQTT_TOPIC_ENV_CONTROL) == 0) {
-    // Process environment control command
-    StaticJsonDocument<256> doc; // Ước tính kích thước đủ cho payload này
+    // Environment control command
+    StaticJsonDocument<256> doc; // Estimated size for this payload
     DeserializationError error = deserializeJson(doc, message);
     
     if (error) {
-      AppLogger.error("MQTTCallbk", "JSON parsing failed: " + String(error.c_str()));
+      AppLogger.logf(LOG_LEVEL_ERROR, "MQTTCallbk", "JSON parsing failed: %s", error.c_str());
       return;
     }
     
@@ -158,30 +158,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       int zone = soil[JSON_KEY_ZONE];
       float value = soil[JSON_KEY_VALUE];
       envManager.setSoilMoisture(zone, value);
-      AppLogger.info("MQTTCallbk", "Manual soil moisture update: Zone " + String(zone) + ", Value: " + String(value));
+      AppLogger.logf(LOG_LEVEL_INFO, "MQTTCallbk", "Manual soil moisture update: Zone %d, Value: %.2f", zone, value);
     }
     
     if (doc.containsKey(JSON_KEY_RAIN)) {
       bool isRaining = doc[JSON_KEY_RAIN];
       envManager.setRainStatus(isRaining);
-      AppLogger.info("MQTTCallbk", "Manual rain status update: " + String(isRaining ? "Raining" : "Not raining"));
+      AppLogger.logf(LOG_LEVEL_INFO, "MQTTCallbk", "Manual rain status update: %s", isRaining ? "Raining" : "Not raining");
     }
     
     if (doc.containsKey(JSON_KEY_LIGHT)) {
       int lightLevel = doc[JSON_KEY_LIGHT];
       envManager.setLightLevel(lightLevel);
-      AppLogger.info("MQTTCallbk", "Manual light level update: " + String(lightLevel));
+      AppLogger.logf(LOG_LEVEL_INFO, "MQTTCallbk", "Manual light level update: %d", lightLevel);
     }
   }
   else if (strcmp(topic, MQTT_TOPIC_LOG_CONFIG) == 0) {
-    // Process log configuration command
-    AppLogger.info("MQTTCallbk", "Received log configuration command. Payload: " + String(message));
+    // Log configuration command
+    AppLogger.logf(LOG_LEVEL_INFO, "MQTTCallbk", "Received log configuration command. Payload: %s", message);
 
-    StaticJsonDocument<128> doc; // Kích thước này đủ cho target và level
+    StaticJsonDocument<128> doc; // Sufficient size for target and level
     DeserializationError error = deserializeJson(doc, message);
 
     if (error) {
-      AppLogger.error("MQTTCallbk", "Log config JSON parsing failed: " + String(error.c_str()));
+      AppLogger.logf(LOG_LEVEL_ERROR, "MQTTCallbk", "Log config JSON parsing failed: %s", error.c_str());
       return;
     }
 
@@ -203,7 +203,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         AppLogger.setMqttLogLevel(newLevel);
         // AppLogger.setMqttLogLevel already logs this change
       } else {
-        AppLogger.warning("MQTTCallbk", "Invalid log config target: " + String(target));
+        AppLogger.logf(LOG_LEVEL_WARNING, "MQTTCallbk", "Invalid log config target: %s", target);
       }
     } else {
       AppLogger.warning("MQTTCallbk", "Log config command missing 'target' or 'level' field.");
@@ -211,9 +211,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// Core 0 Task - Handles sensors, network, MQTT (preemptive)
+// Core 0 Task: Handles sensor readings, network communication, MQTT, and scheduled task updates.
+// This task is preemptive.
 void Core0TaskCode(void * parameter) {
-  AppLogger.info("Core0", "Task started on core " + String(xPortGetCoreID()));
+  AppLogger.logf(LOG_LEVEL_INFO, "Core0", "Task started on core %d", xPortGetCoreID());
   
   for(;;) {
     // Maintain network connection
@@ -225,67 +226,59 @@ void Core0TaskCode(void * parameter) {
     if (currentTime - lastSensorReadTime >= sensorReadInterval) {
       lastSensorReadTime = currentTime;
       
-      // Take mutex before accessing sensor data
+      // Ensure exclusive access to sensor data
       if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY)) {
-        // --- NEW: Performance Logging Start ---
+        // Performance Logging: Sensor Read Operation
         unsigned long sensorReadStartTime = millis();
         bool readSuccess = false;
-        // --- END NEW ---
 
         // Read data from sensors
         if (sensorManager.readSensors()) {
-          // Mark as success
           readSuccess = true;
           
-          // Cập nhật ngay vào EnvironmentManager
+          // Update EnvironmentManager with latest sensor readings
           envManager.setCurrentTemperature(sensorManager.getTemperature());
           envManager.setCurrentHumidity(sensorManager.getHumidity());
           envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
           
           // Log sensor data
-          AppLogger.debug("Core0", "Sensors read: T=" + String(sensorManager.getTemperature()) +
-                          "°C, H=" + String(sensorManager.getHumidity()) +
-                          "%, HI=" + String(sensorManager.getHeatIndex()) + "°C");
+          AppLogger.logf(LOG_LEVEL_DEBUG, "Core0", "Sensors read: T=%.2f°C, H=%.2f%%, HI=%.2f°C", 
+                           sensorManager.getTemperature(), sensorManager.getHumidity(), sensorManager.getHeatIndex());
           
           // Send data to MQTT server immediately after reading
           if (networkManager.isConnected()) {
             // Create JSON payload
             String payload = sensorManager.getJsonPayload(API_KEY);
             
-            // --- NEW: Performance Logging for MQTT Publish Start ---
+            // Performance Logging: MQTT Sensor Data Publish
             unsigned long mqttPublishStartTime = millis();
             bool mqttSuccess = networkManager.publish(MQTT_TOPIC_SENSORS, payload.c_str());
             unsigned long mqttPublishDuration = millis() - mqttPublishStartTime;
             AppLogger.perf("Core0", "MQTTSensorDataPublish", mqttPublishDuration, mqttSuccess);
-            // --- END NEW ---
             
-            // Existing log can be kept or removed since we now have the perf log
             AppLogger.debug("Core0", "Sensor data published to MQTT");
           } else {
             AppLogger.warning("Core0", "No network connection, cannot send sensor data via MQTT");
-            // LED status handled globally below
           }
         } else {
           AppLogger.error("Core0", "Failed to read from sensors");
-          // Mark as failure
           readSuccess = false;
         }
         
-        // --- NEW: Performance Logging End ---
+        // Performance Logging: End Sensor Read Operation
         unsigned long sensorReadDuration = millis() - sensorReadStartTime;
         AppLogger.perf("Core0", "SensorReadOperation", sensorReadDuration, readSuccess);
-        // --- END NEW ---
         
-        // Release mutex after accessing sensor data
+        // Release mutex
         xSemaphoreGive(sensorDataMutex);
       }
     }
     
-    // Publish relay and scheduler status khi có thay đổi hoặc cần gửi dự phòng
+    // Publish relay and scheduler status if changed or for a forced periodic report
     if (networkManager.isConnected()) {
       bool forcedReport = (currentTime - lastForcedStatusReportTime >= forcedStatusReportInterval);
       
-      // Publish relay status khi có thay đổi hoặc gửi dự phòng
+      // Publish relay status if changed or forced report
       if (relayManager.hasStatusChangedAndReset() || forcedReport) {
         String statusPayload = relayManager.getStatusJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_STATUS, statusPayload.c_str());
@@ -296,7 +289,7 @@ void Core0TaskCode(void * parameter) {
         }
       }
       
-      // Publish schedule status khi có thay đổi hoặc gửi dự phòng
+      // Publish schedule status if changed or forced report
       if (taskScheduler.hasScheduleStatusChangedAndReset() || forcedReport) {
         String schedulePayload = taskScheduler.getTasksJson(API_KEY);
         networkManager.publish(MQTT_TOPIC_SCHEDULE_STATUS, schedulePayload.c_str());
@@ -307,51 +300,50 @@ void Core0TaskCode(void * parameter) {
         }
       }
       
-      // Cập nhật thời gian gửi dự phòng nếu đã gửi dự phòng
+      // Update last forced report time if a forced report was sent
       if (forcedReport) {
         lastForcedStatusReportTime = currentTime;
       }
     }
     
-    // Check and update irrigation schedules - Event-driven approach
+    // Check and update irrigation schedules based on their next check time
     time_t current_time_for_scheduler;
     time(&current_time_for_scheduler);
     time_t next_check = taskScheduler.getEarliestNextCheckTime();
     
+    // If no schedule, or if current time is past the next check time
     if (next_check == 0 || current_time_for_scheduler >= next_check) {
-      // Nếu next_check là 0 (chưa có lịch, hoặc cần tính toán lại lần đầu)
-      // hoặc đã đến/qua thời điểm kiểm tra
       taskScheduler.update();
     }
     
-    // Blink LED to show activity status
+    // Blink LED to indicate system status and activity
     if (currentTime - lastLedBlinkTime >= ledBlinkInterval) {
       lastLedBlinkTime = currentTime;
-      ledState = !ledState; // Toggle state for blinking effect
+      ledState = !ledState; 
 
       if (networkManager.isConnected()) {
-        // Blink green LED when connected
+        // Green LED: Connected to WiFi and MQTT
         if (ledState) {
           RGB_Light(0, 20, 0);  // Low brightness green
         } else {
           RGB_Light(0, 0, 0);
         }
       } else if (networkManager.isAttemptingWifiReconnect() || networkManager.isAttemptingMqttReconnect()) {
-        // Blink blue LED when attempting to reconnect
+        // Blue LED: Attempting to reconnect WiFi or MQTT
         if (ledState) {
           RGB_Light(0, 0, 20);  // Low brightness blue
         } else {
           RGB_Light(0, 0, 0);
         }
       } else if (!networkManager.isWifiConnected()){
-        // Blink red LED when WiFi is disconnected and not actively trying to reconnect (e.g. max retries reached for a while)
+        // Red LED: WiFi disconnected (and not actively reconnecting)
         if (ledState) {
           RGB_Light(20, 0, 0); // Low brightness red
         } else {
           RGB_Light(0, 0, 0);
         }
-      } else { // WiFi connected, but MQTT is not, and not actively trying to reconnect MQTT
-        // Blink yellow LED when MQTT is disconnected (and WiFi is up)
+      } else { // WiFi connected, but MQTT is not (and not actively reconnecting)
+        // Yellow LED: MQTT disconnected (WiFi is connected)
          if (ledState) {
           RGB_Light(20, 20, 0); // Low brightness yellow
         } else {
@@ -360,87 +352,79 @@ void Core0TaskCode(void * parameter) {
       }
     }
     
-    // Small delay to prevent WDT reset
+    // Small delay to yield to other tasks and prevent Watchdog Timer (WDT) reset
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
-// Core 1 Task - Xử lý sự kiện từ Relay Timer Queue
+// Core 1 Task: Handles events from the relay timer queue.
+// This task is event-driven, blocking on xQueueReceive.
 void Core1TaskCode(void * parameter) {
-  AppLogger.info("Core1", "Task bắt đầu trên core " + String(xPortGetCoreID()));
+  AppLogger.logf(LOG_LEVEL_INFO, "Core1", "Task bắt đầu trên core %d", xPortGetCoreID());
   RelayTimerEvent_t receivedEvent;
 
   for(;;) {
-    // Chờ sự kiện từ g_relayEventQueue
+    // Wait for an event from the g_relayEventQueue
     if (xQueueReceive(g_relayEventQueue, &receivedEvent, portMAX_DELAY) == pdPASS) {
-      AppLogger.info("Core1", "Đã nhận sự kiện hết hạn timer cho relay index: " + String(receivedEvent.relayIndex));
-      // Gọi RelayManager để tắt relay tương ứng
-      // Hàm turnOff của RelayManager sẽ set _statusChanged,
-      // Core0Task sẽ phát hiện và gửi cập nhật trạng thái MQTT.
+      AppLogger.logf(LOG_LEVEL_INFO, "Core1", "Đã nhận sự kiện hết hạn timer cho relay index: %d", receivedEvent.relayIndex);
+      // RelayManager turns off the relay.
+      // Core0Task will detect the status change and publish MQTT update.
       relayManager.turnOff(receivedEvent.relayIndex);
     }
-    // Task sẽ bị block bởi xQueueReceive cho đến khi có sự kiện,
-    // không cần vTaskDelay cố định ở đây nữa.
+    // Task blocks on xQueueReceive, no explicit vTaskDelay needed here.
   }
 }
 
-// THÊM VÀO: Khai báo đối tượng Preferences
+// Preferences object for Non-Volatile Storage (NVS)
 Preferences preferences;
 
 void setup() {
-  // Initialize Serial as early as possible
   Serial.begin(115200);
   
-  // Wait a bit for Serial to ensure initialization logs can be seen
+  // Wait for Serial to initialize to ensure boot messages are visible
   uint32_t serialStartTime = millis();
-  while (!Serial && (millis() - serialStartTime < 2000)) { // Wait a maximum of 2 seconds
+  while (!Serial && (millis() - serialStartTime < 2000)) { // Max 2 seconds wait
     delay(10);
   }
-  Serial.println(F("\n\nMain: Serial port initialized.")); // F() to save RAM
+  Serial.println(F("\n\nMain: Serial port initialized.")); // F() macro saves RAM
 
-  // THÊM VÀO: Khởi tạo và đọc cấu hình từ NVS (ví dụ)
-  // preferences.begin("app-config", false); // false = read/write, true = read-only
+  // TODO: Consider implementing NVS for WiFi/MQTT credentials
+  // preferences.begin("app-config", false); 
   // String storedSsid = preferences.getString("wifi_ssid", WIFI_SSID);
-  // String storedPassword = preferences.getString("wifi_pass", WIFI_PASSWORD);
-  // String storedMqttServer = preferences.getString("mqtt_server", MQTT_SERVER);
-  // int storedMqttPort = preferences.getInt("mqtt_port", MQTT_PORT);
-  // String storedApiKey = preferences.getString("api_key", API_KEY);
+  // ... and so on for other credentials
   // preferences.end();
-  // Sau đó sử dụng các biến storedSsid, storedPassword,... khi gọi networkManager.begin()
+  // Then use stored values in networkManager.begin()
 
-  // Khởi tạo Queue cho sự kiện Relay Timer
-  g_relayEventQueue = xQueueCreate(10, sizeof(RelayTimerEvent_t)); // 10 là kích thước queue
+  // Initialize queue for relay timer events
+  g_relayEventQueue = xQueueCreate(10, sizeof(RelayTimerEvent_t)); // Queue size of 10
   if (g_relayEventQueue == NULL) {
-      Serial.println(F("Main: LỖI - Không thể tạo relay event queue!"));
-      AppLogger.critical("Setup", "FATAL - Failed to create relay event queue!"); // Log then restart
-      ESP.restart(); // Hoặc xử lý lỗi nghiêm trọng khác
+      Serial.println(F("Main: LỖI - Không thể tạo relay event queue!")); // Error during critical setup
+      AppLogger.critical("Setup", "FATAL - Failed to create relay event queue!"); // Log before restart
+      ESP.restart(); // Restart on critical failure
   } else {
       Serial.println(F("Main: Relay event queue đã được tạo."));
-      // AppLogger might not be ready yet, so Serial print is fine here.
   }
 
-  // Initialize NetworkManager FIRST
-  // Nó sẽ cố gắng kết nối WiFi và MQTT. Nếu thất bại, nó sẽ tự động thử lại trong NetworkManager::loop()
+  // Initialize NetworkManager first. It attempts WiFi/MQTT connection.
+  // Reconnection attempts are handled by NetworkManager::loop() in Core0Task.
   if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
-    AppLogger.error("Setup", "NetworkManager failed to initialize properly. Check logs. System will attempt to reconnect.");
-    // LED sẽ được xử lý trong Core0Task dựa trên trạng thái NetworkManager
+    AppLogger.error("Setup", "NetworkManager failed to initialize properly. System will attempt to reconnect.");
+    // LED status reflecting connection state is handled in Core0Task.
   } else {
     AppLogger.info("Setup", "NetworkManager initialized. Attempting to connect...");
   }
 
-  // Initialize Logger AFTER NetworkManager has been initialized (hoặc ít nhất là cố gắng)
-  // AppLogger có thể cần NetworkManager để gửi log MQTT.
-  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
+  // Initialize Logger after NetworkManager (Logger might use MQTT).
+  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO); // Default log levels
   
-  // --- CRITICAL: Set MQTT Callback function ---
+  // Set the MQTT callback function
   networkManager.setCallback(mqttCallback);
   AppLogger.info("Setup", "MQTT Callback function set.");
-  // --- END CRITICAL ---
 
   AppLogger.info("Setup", "System setup sequence started.");
   AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");
 
-  // Create semaphore
+  // Create mutex for shared sensor data
   sensorDataMutex = xSemaphoreCreateMutex();
   
   // Initialize GPIO
@@ -450,7 +434,7 @@ void setup() {
   
   // Initialize relay manager
   AppLogger.debug("Setup", "Đang khởi tạo RelayManager...");
-  relayManager.begin(relayPins, numRelays, g_relayEventQueue); // Truyền queue vào
+  relayManager.begin(relayPins, numRelays, g_relayEventQueue); // Pass the event queue
   
   // Initialize task scheduler
   AppLogger.debug("Setup", "Đang khởi tạo TaskScheduler...");
@@ -460,35 +444,17 @@ void setup() {
   AppLogger.debug("Setup", "Initializing SensorManager...");
   sensorManager.begin();
   
-  // Configure NTP and MQTT subscriptions if network is connected
-  // VIỆC SUBSCRIBE SẼ DO NETWORKMANAGER TỰ QUẢN LÝ SAU KHI KẾT NỐI
-  // Các lệnh networkManager.subscribe() ở đây sẽ được xóa và chuyển logic vào NetworkManager
-
-  // Đăng ký các topic cần thiết thông qua NetworkManager. 
-  // NetworkManager sẽ lưu chúng lại và tự động subscribe/resubscribe khi kết nối MQTT.
+  // NetworkManager handles subscriptions internally upon successful MQTT connection.
+  // No need to call subscribe directly here after initial setup.
   networkManager.subscribe(MQTT_TOPIC_CONTROL);
   networkManager.subscribe(MQTT_TOPIC_SCHEDULE);
   networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL);
   networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG);
 
-  // Đèn LED và Buzzer báo hiệu trạng thái sẽ được quản lý trong Core0TaskCode dựa trên networkManager.isConnected()
-  // Bỏ các lệnh LED và Buzzer trực tiếp ở đây để tránh xung đột
-  /*
-  if (networkManager.isConnected()) {
-    AppLogger.info("Setup", "Initial network connection successful.");
-    RGB_Light(0, 255, 0); // Green
-    delay(1000);
-    RGB_Light(0, 0, 0);
-    Buzzer_PWM(300);
-  } else {
-    AppLogger.warning("Setup", "Initial network connection failed. Will retry in background.");
-    RGB_Light(255, 0, 0); // Red
-    delay(1000);
-    RGB_Light(0, 0, 0);
-  }
-  */
+  // LED and Buzzer status indicators are managed in Core0TaskCode based on networkManager.isConnected().
+  // Direct signal commands here are removed to avoid conflicts.
 
-  // Create tasks and pin to cores
+  // Create tasks and pin them to specific cores
   AppLogger.info("Setup", "Creating and pinning tasks to cores...");
   xTaskCreatePinnedToCore(
     Core0TaskCode, "Core0Task", STACK_SIZE_CORE0, NULL, PRIORITY_MEDIUM, &core0Task, 0);
@@ -500,21 +466,20 @@ void setup() {
 }
 
 void loop() {
-  // Empty loop - all work is done in tasks
-  delay(1000);
+  // The main loop is intentionally empty as all operations are handled by FreeRTOS tasks.
+  delay(1000); // Minimal delay to keep loop() responsive if needed in future.
 
-  // THÊM VÀO: In ra Stack High Water Mark để theo dõi bộ nhớ
-  // Nên thực hiện sau khi hệ thống đã chạy ổn định một thời gian để có số liệu chính xác.
-  // Có thể đặt trong một điều kiện if để chỉ in định kỳ (ví dụ: mỗi 60 giây)
+  // Periodically log Stack High Water Mark (HWM) for task memory usage monitoring.
+  // This helps in optimizing task stack sizes.
   static unsigned long lastStackCheckTime = 0;
-  if (millis() - lastStackCheckTime > 60000) { // Mỗi 60 giây
+  if (millis() - lastStackCheckTime > 60000) { // Check every 60 seconds
     lastStackCheckTime = millis();
     UBaseType_t core0StackHWM = uxTaskGetStackHighWaterMark(core0Task);
     UBaseType_t core1StackHWM = uxTaskGetStackHighWaterMark(core1Task);
-    AppLogger.info("StackCheck", "Core0Task HWM: " + String(core0StackHWM) + " words (" + String(core0StackHWM * sizeof(StackType_t)) + " bytes)");
-    AppLogger.info("StackCheck", "Core1Task HWM: " + String(core1StackHWM) + " words (" + String(core1StackHWM * sizeof(StackType_t)) + " bytes)");
-    // Lưu ý: "words" ở đây là StackType_t, thường là 4 byte trên ESP32.
-    // Dựa vào kết quả này, bạn có thể điều chỉnh STACK_SIZE_CORE0 và STACK_SIZE_CORE1.
-    // Ví dụ, nếu HWM là 1000 words (4000 bytes) và STACK_SIZE là 8192 bytes, bạn có thể giảm STACK_SIZE.
+    AppLogger.logf(LOG_LEVEL_INFO, "StackCheck", "Core0Task HWM: %u words (%u bytes)", core0StackHWM, core0StackHWM * sizeof(StackType_t));
+    AppLogger.logf(LOG_LEVEL_INFO, "StackCheck", "Core1Task HWM: %u words (%u bytes)", core1StackHWM, core1StackHWM * sizeof(StackType_t));
+    // Note: "words" here refers to StackType_t, typically 4 bytes on ESP32.
+    // Use these HWM values to fine-tune STACK_SIZE_CORE0 and STACK_SIZE_CORE1.
+    // E.g., if HWM is 1000 words (4000 bytes) and STACK_SIZE is 8192 bytes, STACK_SIZE can be reduced.
   }
 }
