@@ -189,63 +189,121 @@ String RelayManager::getStatusJson(const char* apiKey) {
 }
 
 bool RelayManager::processCommand(const char* json) {
-    // Parse JSON
+    unsigned long cmdStartTime = millis();
+    bool commandParseSuccess = false; // Indicates if overall JSON and basic structure are OK
+    String perfDetails = "";
+
+    AppLogger.debug("RelayMgrCmd", "Received JSON: " + String(json));
     DynamicJsonDocument doc(512);
     DeserializationError error = deserializeJson(doc, json);
-    
+
     if (error) {
         AppLogger.error("RelayMgr", "JSON parsing failed: " + String(error.c_str()));
+        perfDetails = "JSON parsing failed";
+        unsigned long cmdDuration = millis() - cmdStartTime;
+        AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, commandParseSuccess, perfDetails);
         return false;
     }
-    
-    // Kiểm tra nếu có trường relays
+
     if (!doc.containsKey("relays")) {
         AppLogger.error("RelayMgr", "Command missing 'relays' field");
+        perfDetails = "Missing 'relays' field";
+        unsigned long cmdDuration = millis() - cmdStartTime;
+        AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, commandParseSuccess, perfDetails);
         return false;
     }
-    
+
     JsonArray relays = doc["relays"];
-    bool anyChanges = false;
-    
-    // Xử lý mỗi relay trong danh sách
-    for (JsonObject relay : relays) {
-        // Kiểm tra nếu có id và state
-        if (relay.containsKey("id") && relay.containsKey("state")) {
-            int id = relay["id"];
-            bool state = relay["state"];
+    if (relays.isNull()) {
+        AppLogger.warning("RelayMgr", "'relays' array is null.");
+        perfDetails = "'relays' array is null";
+        commandParseSuccess = true; // Parsed successfully, but relays array is effectively empty.
+        unsigned long cmdDuration = millis() - cmdStartTime;
+        AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, commandParseSuccess, perfDetails);
+        return false; // No changes made
+    }
+
+    commandParseSuccess = true; // Basic structure is fine up to here
+    bool actualStateChangesOccurred = false;
+    int relayCommandsInPayload = relays.size();
+    int validRelayObjectsFound = 0; // Counts how many objects in the array looked like relay commands
+
+    for (JsonObject relayCmd : relays) {
+        if (relayCmd.containsKey("id") && relayCmd.containsKey("state")) {
+            validRelayObjectsFound++;
+
+            int id = relayCmd["id"];
+            bool state = relayCmd["state"];
             unsigned long duration = 0;
-            
-            // Kiểm tra nếu có duration
-            if (relay.containsKey("duration") && state) {
-                duration = relay["duration"];
-                // Convert seconds to milliseconds if needed
-                if (duration < 10000) {
+
+            if (relayCmd.containsKey("duration") && state) {
+                duration = relayCmd["duration"];
+                if (duration < 10000 && duration != 0) {
                     duration *= 1000;
                 }
             }
-            
-            // Điều khiển relay (0-based index, nhưng id là 1-based)
+
             if (id >= 1 && id <= _numRelays) {
                 int relayIndex = id - 1;
                 
-                // Kiểm tra xem có sự thay đổi không trước khi cập nhật
-                bool currentState = _relayStatus[relayIndex].state;
-                unsigned long currentEndTime = _relayStatus[relayIndex].endTime;
-                bool willChange = (currentState != state) || 
-                                (state && duration > 0 && 
-                                 (currentEndTime == 0 || currentEndTime != millis() + duration));
-                
-                if (willChange) {
-                    setRelay(relayIndex, state, duration);
-                    anyChanges = true;
+                // Original logic to determine if a state change is needed and setRelay should be called
+                // This attempts to mimic the condition under which setRelay would lead to a change.
+                // A brief mutex lock is added for safety when reading current relay status.
+                bool currentState;
+                unsigned long currentEndTime;
+                bool performSetRelay = false;
+
+                if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(10))) { // Brief attempt to get mutex
+                    currentState = _relayStatus[relayIndex].state;
+                    currentEndTime = _relayStatus[relayIndex].endTime;
+                    xSemaphoreGive(_mutex);
+
+                    // Determine if setRelay should be called based on current state and command
+                    if (currentState != state) {
+                        performSetRelay = true;
+                    } else if (state) { // If command is to turn ON and it's already ON
+                        if (duration > 0) { // If a duration is specified
+                            // Check if current operation is timed and if the new duration is different
+                            // Note: millis() comparison for endTime can be tricky due to passage of time
+                            if (currentEndTime == 0 || currentEndTime != (millis() + duration)) { // Simplified check
+                                performSetRelay = true;
+                            }
+                        } else { // Turning ON indefinitely
+                            if (currentEndTime != 0) { // If it was previously timed
+                                performSetRelay = true;
+                            }
+                        }
+                    }
+                    // If command is to turn OFF (state=false) and it's already OFF, performSetRelay remains false.
+                } else {
+                    AppLogger.warning("RelayMgr", "Could not take mutex for relay " + String(id) + " state check, skipping update for this relay.");
+                    performSetRelay = false; 
+                }
+
+                if (performSetRelay) {
+                    setRelay(relayIndex, state, duration); // setRelay handles its own mutex for writing
+                    actualStateChangesOccurred = true;
                 }
             } else {
-                AppLogger.error("RelayMgr", "Invalid relay ID: " + String(id));
+                AppLogger.error("RelayMgr", "Invalid relay ID: " + String(id) + " in command's relay object.");
             }
         }
     }
-    
-    return anyChanges;
+
+    if (validRelayObjectsFound > 0) {
+        perfDetails = String(validRelayObjectsFound) + "/" + String(relayCommandsInPayload) + " relay obj(s) valid. ";
+        if(actualStateChangesOccurred) perfDetails += "State changed."; else perfDetails += "No state change.";
+    } else if (relayCommandsInPayload > 0) { // Array had items, but none were valid relay command structures
+        perfDetails = "No valid relay objects in 'relays' array of size " + String(relayCommandsInPayload);
+        commandParseSuccess = false; // Structure was bad if items existed but weren't processable
+    } else { // relays.size() == 0
+        perfDetails = "'relays' array was empty.";
+    }
+
+    unsigned long cmdDuration = millis() - cmdStartTime;
+    AppLogger.perf("RelayMgr", "RelayControlProcessing", cmdDuration, commandParseSuccess, perfDetails);
+
+    return actualStateChangesOccurred;
 }
 
 bool RelayManager::hasStatusChangedAndReset() {

@@ -1,0 +1,19 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Include Directory Overview
+
+This document outlines the header files found in the `include` directory and their primary responsibilities.
+
+## Header Files
+
+- **[NetworkManager.h](mdc:include/NetworkManager.h)**: Manages network connectivity, likely Wi-Fi setup, and communication protocols (e.g., HTTP, MQTT).
+- **[Logger.h](mdc:include/Logger.h)**: Provides logging functionalities for debugging and monitoring the application.
+- **[RelayManager.h](mdc:include/RelayManager.h)**: Handles the control and status of relays.
+- **[TaskScheduler.h](mdc:include/TaskScheduler.h)**: Manages scheduled tasks and their execution.
+- **[EnvironmentManager.h](mdc:include/EnvironmentManager.h)**: Manages environmental settings or configurations.
+- **[SensorManager.h](mdc:include/SensorManager.h)**: Responsible for interfacing with and managing various sensors.
+- **[WS_GPIO.h](mdc:include/WS_GPIO.h)**: Likely handles GPIO (General Purpose Input/Output) pin configurations and operations, possibly for a specific component or WebSocket interaction.
+- **[README](mdc:include/README)**: Provides general information about the contents or usage of the `include` directory or its files.

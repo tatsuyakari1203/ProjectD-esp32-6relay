@@ -1,0 +1,20 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Source Directory Overview
+
+This document outlines the C++ source files found in the `src` directory and their primary responsibilities, corresponding to the header files in the `include` directory.
+
+## Source Files
+
+- **[main.cpp](mdc:src/main.cpp)**: The main entry point of the application. Initializes modules and contains the primary application loop.
+- **[Logger.cpp](mdc:src/Logger.cpp)**: Implements the logging functionalities defined in `Logger.h`.
+- **[NetworkManager.cpp](mdc:src/NetworkManager.cpp)**: Implements network management features defined in `NetworkManager.h`.
+- **[RelayManager.cpp](mdc:src/RelayManager.cpp)**: Implements relay control logic defined in `RelayManager.h`.
+- **[WS_GPIO.cpp](mdc:src/WS_GPIO.cpp)**: Implements GPIO functionalities, likely related to WebSockets, as defined in `WS_GPIO.h`.
+- **[EnvironmentManager.cpp](mdc:src/EnvironmentManager.cpp)**: Implements environment management logic defined in `EnvironmentManager.h`.
+- **[SensorManager.cpp](mdc:src/SensorManager.cpp)**: Implements sensor data acquisition and management logic defined in `SensorManager.h`.
+- **[TaskScheduler.cpp](mdc:src/TaskScheduler.cpp)**: Implements the task scheduling logic defined in `TaskScheduler.h`.
+

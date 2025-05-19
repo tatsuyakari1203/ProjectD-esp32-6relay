@@ -409,6 +409,11 @@ void setup() {
   // AppLogger có thể cần NetworkManager để gửi log MQTT.
   AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
   
+  // --- CRITICAL: Set MQTT Callback function ---
+  networkManager.setCallback(mqttCallback);
+  AppLogger.info("Setup", "MQTT Callback function set.");
+  // --- END CRITICAL ---
+
   AppLogger.info("Setup", "System setup sequence started.");
   AppLogger.info("Setup", "ESP32-S3 Dual-Core Irrigation System");
 
