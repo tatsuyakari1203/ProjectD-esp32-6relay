@@ -8,6 +8,9 @@
 #include "../include/Logger.h"
 #include <time.h>
 #include <Preferences.h>
+#include "freertos/FreeRTOS.h" 
+#include "freertos/task.h"
+#include "freertos/queue.h"    
 
 // THÊM VÀO: Hằng số cho JSON keys
 static const char* JSON_KEY_SOIL_MOISTURE = "soil_moisture";
@@ -101,6 +104,9 @@ const unsigned long ledBlinkInterval = 1000;  // Blink LED every 1 second
 
 // Semaphores for safe access to shared resources
 SemaphoreHandle_t sensorDataMutex;
+
+// Khai báo QueueHandle_t toàn cục cho sự kiện Relay Timer
+QueueHandle_t g_relayEventQueue; 
 
 // Function to display current time
 void printLocalTime() {
@@ -359,16 +365,22 @@ void Core0TaskCode(void * parameter) {
   }
 }
 
-// Core 1 Task - Handles irrigation control (non-preemptive)
+// Core 1 Task - Xử lý sự kiện từ Relay Timer Queue
 void Core1TaskCode(void * parameter) {
-  AppLogger.info("Core1", "Task started on core " + String(xPortGetCoreID()));
-  
+  AppLogger.info("Core1", "Task bắt đầu trên core " + String(xPortGetCoreID()));
+  RelayTimerEvent_t receivedEvent;
+
   for(;;) {
-    // Update relay manager to handle timer-based relay control
-    relayManager.update();
-    
-    // This is a non-preemptive task, so we can have longer delay
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    // Chờ sự kiện từ g_relayEventQueue
+    if (xQueueReceive(g_relayEventQueue, &receivedEvent, portMAX_DELAY) == pdPASS) {
+      AppLogger.info("Core1", "Đã nhận sự kiện hết hạn timer cho relay index: " + String(receivedEvent.relayIndex));
+      // Gọi RelayManager để tắt relay tương ứng
+      // Hàm turnOff của RelayManager sẽ set _statusChanged,
+      // Core0Task sẽ phát hiện và gửi cập nhật trạng thái MQTT.
+      relayManager.turnOff(receivedEvent.relayIndex);
+    }
+    // Task sẽ bị block bởi xQueueReceive cho đến khi có sự kiện,
+    // không cần vTaskDelay cố định ở đây nữa.
   }
 }
 
@@ -395,6 +407,17 @@ void setup() {
   // String storedApiKey = preferences.getString("api_key", API_KEY);
   // preferences.end();
   // Sau đó sử dụng các biến storedSsid, storedPassword,... khi gọi networkManager.begin()
+
+  // Khởi tạo Queue cho sự kiện Relay Timer
+  g_relayEventQueue = xQueueCreate(10, sizeof(RelayTimerEvent_t)); // 10 là kích thước queue
+  if (g_relayEventQueue == NULL) {
+      Serial.println(F("Main: LỖI - Không thể tạo relay event queue!"));
+      AppLogger.critical("Setup", "FATAL - Failed to create relay event queue!"); // Log then restart
+      ESP.restart(); // Hoặc xử lý lỗi nghiêm trọng khác
+  } else {
+      Serial.println(F("Main: Relay event queue đã được tạo."));
+      // AppLogger might not be ready yet, so Serial print is fine here.
+  }
 
   // Initialize NetworkManager FIRST
   // Nó sẽ cố gắng kết nối WiFi và MQTT. Nếu thất bại, nó sẽ tự động thử lại trong NetworkManager::loop()
@@ -426,11 +449,11 @@ void setup() {
   AppLogger.info("Setup", "GPIO initialized");
   
   // Initialize relay manager
-  AppLogger.debug("Setup", "Initializing RelayManager...");
-  relayManager.begin(relayPins, numRelays);
+  AppLogger.debug("Setup", "Đang khởi tạo RelayManager...");
+  relayManager.begin(relayPins, numRelays, g_relayEventQueue); // Truyền queue vào
   
   // Initialize task scheduler
-  AppLogger.debug("Setup", "Initializing TaskScheduler...");
+  AppLogger.debug("Setup", "Đang khởi tạo TaskScheduler...");
   taskScheduler.begin();
   
   // Initialize sensors
