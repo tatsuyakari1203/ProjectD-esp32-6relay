@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h" 
 #include "freertos/task.h"
 #include "freertos/queue.h"    
+#include <vector> // Required for std::vector
 
 // JSON keys for MQTT payloads
 static const char* JSON_KEY_SOIL_MOISTURE = "soil_moisture";
@@ -81,7 +82,20 @@ const char* MQTT_TOPIC_ENV_CONTROL = "irrigation/esp32_6relay/environment";
 const char* MQTT_TOPIC_LOG_CONFIG = "irrigation/esp32_6relay/logconfig";
 
 // NTP configuration
-const char* NTP_SERVER = "pool.ntp.org";
+// const char* NTP_SERVER = "time.google.com"; // Replaced by ntpServerList
+std::vector<const char*> ntpServerList = {
+    "0.vn.pool.ntp.org",  // Vietnam NTP Pool
+    "1.vn.pool.ntp.org",  // Vietnam NTP Pool
+    "2.vn.pool.ntp.org",  // Vietnam NTP Pool
+    "0.asia.pool.ntp.org",// Asia NTP Pool
+    "1.asia.pool.ntp.org",// Asia NTP Pool
+    "2.asia.pool.ntp.org",// Asia NTP Pool
+    "time.google.com",    // Google Public NTP
+    "pool.ntp.org",       // Global NTP Pool Fallback
+    // Keeping VNNIC hostnames as lower priority as they failed DNS previously
+    "1.ntp.vnix.vn",      // VNNIC (lower priority)
+    "2.ntp.vnix.vn"       // VNNIC (lower priority)
+};
 const char* TZ_INFO = "Asia/Ho_Chi_Minh";  // Vietnam timezone
 
 // Sensor and manager objects
@@ -257,8 +271,8 @@ void Core0TaskCode(void * parameter) {
           envManager.setCurrentHeatIndex(sensorManager.getHeatIndex());
           
           // Log sensor data
-          AppLogger.logf(LOG_LEVEL_DEBUG, "Core0", "Sensors read: T=%.2f°C, H=%.2f%%, HI=%.2f°C", 
-                           sensorManager.getTemperature(), sensorManager.getHumidity(), sensorManager.getHeatIndex());
+          AppLogger.logf(LOG_LEVEL_DEBUG, "Core0", "Sensors read: T=%.2f°C, H=%.2f%%, HI=%.2f°C, Soil=%.2f%%", 
+                           sensorManager.getTemperature(), sensorManager.getHumidity(), sensorManager.getHeatIndex(), sensorManager.getSoilMoisture());
           
           // Send data to MQTT server immediately after reading
           if (networkManager.isConnected()) {
@@ -420,7 +434,12 @@ void setup() {
       Serial.println(F("Main: Relay event queue đã được tạo."));
   }
 
-  // Initialize NetworkManager first. It attempts WiFi/MQTT connection.
+  // Initialize Logger first, so all other modules can use it immediately.
+  // Pass nullptr for NetworkManager initially, it will be set if MQTT logging is enabled and NM connects.
+  AppLogger.begin(nullptr, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO); // Default log levels
+  AppLogger.info("Setup", "Logger initialized.");
+
+  // Initialize NetworkManager. It attempts WiFi/MQTT connection.
   // Reconnection attempts are handled by NetworkManager::loop() in Core0Task.
   if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
     AppLogger.error("Setup", "NetworkManager failed to initialize properly. System will attempt to reconnect.");
@@ -428,10 +447,15 @@ void setup() {
   } else {
     AppLogger.info("Setup", "NetworkManager initialized. Attempting to connect...");
   }
-
-  // Initialize Logger after NetworkManager (Logger might use MQTT).
-  AppLogger.begin(&networkManager, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO); // Default log levels
   
+  // If MQTT logging is enabled, now that NetworkManager is initialized (and might be connected),
+  // pass the NetworkManager instance to the logger.
+  // AppLogger.begin() can be called again or have a method to update the network manager.
+  // For simplicity, we re-call begin here. If MQTT was already set to a level > NONE,
+  // it will attempt to use the networkManager instance now.
+  AppLogger.begin(&networkManager, AppLogger.getSerialLogLevel(), AppLogger.getMqttLogLevel());
+  AppLogger.info("Setup", "AppLogger re-initialized with NetworkManager link for MQTT logs.");
+
   // Set the MQTT callback function
   networkManager.setCallback(mqttCallback);
   AppLogger.info("Setup", "MQTT Callback function set.");

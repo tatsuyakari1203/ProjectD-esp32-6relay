@@ -9,6 +9,7 @@
 // DHT Sensor Configuration
 #define DHT_PIN 6      // GPIO pin for DHT21 sensor
 #define DHT_TYPE DHT21 // Type of DHT sensor
+#define SOIL_MOISTURE_PIN 4 // GPIO pin for soil moisture sensor (e.g., A0 on sensor -> GPIO4 on ESP32-S3)
 
 class SensorManager {
 public:
@@ -18,6 +19,7 @@ public:
     float getTemperature();
     float getHumidity();
     float getHeatIndex();
+    float getSoilMoisture(); // Getter for soil moisture
     String getJsonPayload(const char* apiKey); // Generates a JSON string with sensor data
     
 private:
@@ -25,6 +27,7 @@ private:
     float _temperature;           // Last read temperature in Celsius
     float _humidity;              // Last read humidity in %
     float _heatIndex;             // Last calculated heat index in Celsius
+    float _soilMoisture;          // Last read soil moisture in %
     unsigned long _lastReadTime;  // Timestamp of the last sensor read attempt (millis)
     const unsigned long _readInterval = 2000; // Interval between sensor reads (milliseconds)
     bool _readSuccess;            // Status of the last sensor read attempt

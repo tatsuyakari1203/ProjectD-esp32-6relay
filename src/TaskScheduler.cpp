@@ -16,7 +16,7 @@ void TaskScheduler::begin() {
         _earliestNextCheckTime = 0; // Recalculate on first update or task addition.
         _scheduleStatusChanged = true; // Mark as changed to send initial status.
         
-        Serial.println("TaskScheduler initialized"); // TODO: Replace with AppLogger.info if appropriate timing
+        AppLogger.info("TaskSched", "TaskScheduler initialized");
         
         xSemaphoreGive(_mutex);
     }
@@ -30,11 +30,29 @@ bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task) {
         
         if (it != _tasks.end()) {
             // Update existing task.
-            *it = task;
-            // Recalculate its next run time based on new settings.
-            it->next_run = calculateNextRunTime(*it);
-            
-            Serial.println("Updated irrigation task ID: " + String(task.id)); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Updating task ID: %d. Previous state: %d, New active: %s", task.id, it->state, task.active ? "true" : "false");
+            // If the task was running and is now being set to inactive, stop its relays.
+            if (it->state == RUNNING && !task.active) {
+                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task ID: %d was RUNNING and is being deactivated. Stopping relays.", task.id);
+                stopTask(*it); // Stop based on the *old* task's zone configuration
+                it->state = IDLE; // Explicitly set to IDLE as it's being deactivated
+                _scheduleStatusChanged = true; // State changed
+            }
+            *it = task; // Apply the update from the new task definition
+            // If the task remains active, or becomes active, recalculate its next run time.
+            // If it became inactive (handled above), next_run is less critical but calculateNextRunTime handles it.
+            if (it->active) {
+                 it->next_run = calculateNextRunTime(*it);
+            } else {
+                // If task is made inactive, its next_run should be cleared or set to 0
+                it->next_run = 0;
+                // Ensure state is IDLE if it was not already set (e.g. if it wasn't running before)
+                if (it->state != IDLE) { // It might have been COMPLETED before update
+                    it->state = IDLE;
+                    _scheduleStatusChanged = true; // State changed
+                }
+            }
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Updated irrigation task ID: %d. New next_run: %lu, New state: %d", task.id, (unsigned long)it->next_run, it->state);
         } else {
             // Add new task.
             IrrigationTask newTask = task;
@@ -45,7 +63,7 @@ bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task) {
             
             _tasks.push_back(newTask);
             
-            Serial.println("Added new irrigation task ID: " + String(task.id)); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Added new irrigation task ID: %d", task.id);
         }
         
         _scheduleStatusChanged = true; // Flag that schedule has changed.
@@ -73,7 +91,7 @@ bool TaskScheduler::deleteTask(int taskId) {
             _scheduleStatusChanged = true; // Flag that schedule has changed.
             recomputeEarliestNextCheckTime(); // Update the overall next check time.
             
-            Serial.println("Deleted irrigation task ID: " + String(taskId)); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Deleted irrigation task ID: %d", taskId);
             xSemaphoreGive(_mutex);
             return true;
         }
@@ -81,7 +99,7 @@ bool TaskScheduler::deleteTask(int taskId) {
         xSemaphoreGive(_mutex);
     }
     
-    Serial.println("Task ID not found for deletion: " + String(taskId)); // TODO: AppLogger
+    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task ID not found for deletion: %d", taskId);
     return false;
 }
 
@@ -137,9 +155,16 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
             if (task.next_run > 0) {
                 char next_run_str[25];
                 struct tm next_timeinfo;
-                localtime_r(&task.next_run, &next_timeinfo);
-                strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
-                taskObj["next_run"] = next_run_str;
+                if (localtime_r(&task.next_run, &next_timeinfo)) {
+                    strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
+                    taskObj["next_run"] = next_run_str;
+                } else {
+                    AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Task %d: localtime_r failed for next_run timestamp %ld", task.id, (long)task.next_run);
+                    taskObj["next_run"] = nullptr; // Serialize as null if localtime_r fails
+                }
+            } else {
+                // If task.next_run is 0 (or less), set to null in JSON.
+                taskObj["next_run"] = nullptr;
             }
             
             // Add sensor condition details if enabled for the task.
@@ -221,7 +246,7 @@ bool TaskScheduler::processCommand(const char* json) {
     DeserializationError error = deserializeJson(doc, json);
     
     if (error) {
-        Serial.println("JSON parsing failed: " + String(error.c_str()));
+        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed: %s", error.c_str());
         return false;
     }
     
@@ -234,7 +259,7 @@ bool TaskScheduler::processCommand(const char* json) {
     
     // Check for the main "tasks" array for add/update operations.
     if (!doc.containsKey("tasks")) {
-        Serial.println("Missing 'tasks' field in command");
+        AppLogger.error("TaskSched", "Missing 'tasks' field in command");
         return false;
     }
     
@@ -251,7 +276,7 @@ bool TaskScheduler::processCommand(const char* json) {
             !taskJson.containsKey("duration") ||
             !taskJson.containsKey("zones")) {
             
-            Serial.println("Missing required fields in task object");
+            AppLogger.error("TaskSched", "Missing required fields in task object");
             continue; // Skip this malformed task object.
         }
         
@@ -380,13 +405,13 @@ bool TaskScheduler::processDeleteCommand(const char* json) {
     DeserializationError error = deserializeJson(doc, json);
     
     if (error) {
-        Serial.println("JSON parsing failed for delete command: " + String(error.c_str())); // TODO: AppLogger
+        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed for delete command: %s", error.c_str());
         return false;
     }
     
     // Expects a "delete_tasks" array field containing task IDs.
     if (!doc.containsKey("delete_tasks")) {
-        Serial.println("Missing 'delete_tasks' field in delete command."); // TODO: AppLogger
+        AppLogger.error("TaskSched", "Missing 'delete_tasks' field in delete command.");
         return false;
     }
     
@@ -443,8 +468,14 @@ void TaskScheduler::update() {
                     // Calculate the next run time for this completed task.
                     task.next_run = calculateNextRunTime(task);
                     
-                    Serial.println("Task " + String(task.id) + " completed, next run at: " + 
-                                   String(ctime(&task.next_run))); // TODO: AppLogger & better time formatting
+                    if (task.next_run > 0) {
+                        char timebuf[30];
+                        ctime_r(&task.next_run, timebuf);
+                        timebuf[strlen(timebuf)-1] = 0; // Remove newline
+                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed, next run at: %s", task.id, timebuf);
+                    } else {
+                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed, no further runs scheduled (next_run is 0).", task.id);
+                    }
                 }
             }
         }
@@ -462,11 +493,11 @@ void TaskScheduler::update() {
             
             // If day and time match:
             if (isDayMatch && isTimeMatch) {
-                Serial.println("Task " + String(task.id) + " scheduled time match"); // TODO: AppLogger.debug
+                AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d scheduled time match", task.id);
                 
                 // Check sensor conditions before starting.
                 if (!checkSensorConditions(task)) {
-                    Serial.println("Task " + String(task.id) + " conditions not met, skipping."); // TODO: AppLogger.info
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d conditions not met, skipping.", task.id);
                     // Recalculate next run for this skipped task to avoid re-triggering immediately if conditions persist.
                     task.next_run = calculateNextRunTime(task, true); // `true` indicates it's being skipped now.
                     anyStateChangedThisUpdate = true; // Next run time changed.
@@ -480,12 +511,11 @@ void TaskScheduler::update() {
                     if (isZoneBusy(zoneId)) {
                         // If zone is busy, check if this task has higher priority to preempt.
                         if (isHigherPriority(task.id, zoneId)) { // Pass zoneId to check specific conflicting task
-                            Serial.println("Task " + String(task.id) + 
-                                          " has higher priority, stopping conflicting tasks in zone " + String(zoneId)); // TODO: AppLogger
+                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d has higher priority, stopping conflicting tasks in zone %u", task.id, zoneId);
                             
                             // Find and stop lower priority tasks using this zone.
                             for (auto& runningTask : _tasks) {
-                                if (runningTask.state == RUNNING && runningTask.priority < task.priority) {
+                                if (runningTask.state == RUNNING) {
                                     // Check if this runningTask uses the conflicting zoneId.
                                     if (std::find(runningTask.zones.begin(), 
                                                 runningTask.zones.end(), 
@@ -500,16 +530,14 @@ void TaskScheduler::update() {
                                         
                                         runningTask.next_run = calculateNextRunTime(runningTask);
                                         
-                                        Serial.println("Preempted task " + String(runningTask.id) + 
-                                                     " due to higher priority task " + String(task.id)); // TODO: AppLogger
+                                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Preempted task %d due to higher priority task %d", runningTask.id, task.id);
                                     }
                                 }
                             }
                         } else {
                             // Not high enough priority to preempt the currently running task in this zone.
                             canStartThisTask = false;
-                            Serial.println("Task " + String(task.id) + 
-                                          " cannot start, zone " + String(zoneId) + " busy with higher or equal priority task."); // TODO: AppLogger
+                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d cannot start, zone %u busy with higher or equal priority task.", task.id, zoneId);
                             // Reschedule this task for its next logical slot because it couldn't run now.
                             task.next_run = calculateNextRunTime(task, true); // `true` means it was skipped.
                             anyStateChangedThisUpdate = true; // Next run time changed.
@@ -555,8 +583,7 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
     if (condition.temperature_check) {
         float temp = _envManager.getTemperature();
         if (temp < condition.min_temperature || temp > condition.max_temperature) {
-            Serial.println("Task " + String(task.id) + 
-                         " skipped due to temperature out of range: " + String(temp) + "°C"); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to temperature out of range: %.2f C", task.id, temp);
             return false;
         }
     }
@@ -565,8 +592,7 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
     if (condition.humidity_check) {
         float humidity = _envManager.getHumidity();
         if (humidity < condition.min_humidity || humidity > condition.max_humidity) {
-            Serial.println("Task " + String(task.id) + 
-                         " skipped due to humidity out of range: " + String(humidity) + "%"); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to humidity out of range: %.2f %%", task.id, humidity);
             return false;
         }
     }
@@ -576,9 +602,7 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
         for (uint8_t zoneId : task.zones) {
             float moisture = _envManager.getSoilMoisture(zoneId);
             if (moisture > condition.min_soil_moisture) { // Assumes task should run if moisture is LOW, so skip if HIGH.
-                Serial.println("Task " + String(task.id) + 
-                             " skipped due to soil moisture in zone " + String(zoneId) + 
-                             " above threshold: " + String(moisture) + "%"); // TODO: AppLogger
+                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to soil moisture in zone %u above threshold: %.2f %%", task.id, zoneId, moisture);
                 return false;
             }
         }
@@ -587,7 +611,7 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
     // Rain check.
     if (condition.rain_check && condition.skip_when_raining) {
         if (_envManager.isRaining()) {
-            Serial.println("Task " + String(task.id) + " skipped due to rain"); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to rain", task.id);
             return false;
         }
     }
@@ -596,8 +620,7 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
     if (condition.light_check) {
         int light = _envManager.getLightLevel();
         if (light < condition.min_light || light > condition.max_light) {
-            Serial.println("Task " + String(task.id) + 
-                         " skipped due to light level out of range: " + String(light) + " lux"); // TODO: AppLogger
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to light level out of range: %d lux", task.id, light);
             return false;
         }
     }
@@ -614,20 +637,20 @@ void TaskScheduler::startTask(IrrigationTask& task) {
             
             _activeZonesBits.set(relayIndex); // Mark this zone (relay index) as active.
         } else {
-            Serial.println("ERROR: Invalid zoneId " + String(zoneId) + " in startTask for task " + String(task.id)); // TODO: AppLogger.error
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in startTask for task %d", zoneId, task.id);
         }
     }
     
     task.start_time = time(NULL); // Record task start time.
     
-    Serial.print("Started irrigation task " + String(task.id) + 
-                  " for " + String(task.duration) + " minutes on zones: "); // TODO: AppLogger.info
-                  
-    for (uint8_t zoneId : task.zones) {
-        Serial.print(zoneId);
-        Serial.print(" ");
+    String zonesStr = "";
+    for (size_t i = 0; i < task.zones.size(); ++i) {
+        zonesStr += String(task.zones[i]);
+        if (i < task.zones.size() - 1) {
+            zonesStr += ", ";
+        }
     }
-    Serial.println();
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Started irrigation task %d for %u minutes on zones: [%s]", task.id, task.duration, zonesStr.c_str());
 }
 
 void TaskScheduler::stopTask(IrrigationTask& task) {
@@ -639,11 +662,11 @@ void TaskScheduler::stopTask(IrrigationTask& task) {
             
             _activeZonesBits.reset(relayIndex); // Mark this zone (relay index) as inactive.
         } else {
-             Serial.println("ERROR: Invalid zoneId " + String(zoneId) + " in stopTask for task " + String(task.id)); // TODO: AppLogger.error
+             AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in stopTask for task %d", zoneId, task.id);
         }
     }
     
-    Serial.println("Stopped irrigation task " + String(task.id)); // TODO: AppLogger.info
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Stopped irrigation task %d", task.id);
 }
 
 // Checks if a specific zone (1-based) is currently part of an active (RUNNING) task.
@@ -651,7 +674,7 @@ bool TaskScheduler::isZoneBusy(uint8_t zoneId) {
     if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
         return _activeZonesBits.test(zoneId - 1); // Test 0-based index.
     }
-    Serial.println("ERROR: Invalid zoneId in isZoneBusy: " + String(zoneId)); // TODO: AppLogger.error
+    AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId in isZoneBusy: %u", zoneId);
     return false; // Invalid zone ID is considered not busy, or handle error differently.
 }
 
@@ -695,12 +718,22 @@ time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isReschedu
     struct tm timeinfo_now; // Stores current time details
     localtime_r(&now, &timeinfo_now);
 
+    // Log the task details at the beginning of the calculation
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d, Days Bitmap: 0x%02X, Hour: %d, Minute: %d, isRescheduleAfterSkip: %s, Current Epoch: %lu", 
+                    task.id, task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)now);
+
     struct tm scheduled_tm = timeinfo_now; // Start with current time structure
     
     // Set the scheduled hour and minute from the task.
     scheduled_tm.tm_hour = task.hour;
     scheduled_tm.tm_min = task.minute;
     scheduled_tm.tm_sec = 0;
+    
+    // If the task has no scheduled days, it should not have a next_run time.
+    if (task.days == 0) {
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d has no scheduled days (days bitmap is 0). Setting next_run to 0.", task.id);
+        return 0; // Signifies no valid next run time based on days
+    }
     
     // Find the next suitable day, starting from today.
     for (int dayOffset = 0; dayOffset < 8; dayOffset++) { // Check up to 7 days ahead.
@@ -732,17 +765,10 @@ time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isReschedu
         }
     }
     
-    // Should not be reached if task has at least one day active, as loop is 0-7.
-    // Fallback: If no suitable day found within 7 days (e.g., task.days is 0), schedule for a week from now at the task's time.
-    // This behavior might need refinement based on desired handling of tasks with no active days.
-    scheduled_tm = timeinfo_now; // Reset to current time structure
-    scheduled_tm.tm_mday += 7;   // Move one week ahead
-    scheduled_tm.tm_hour = task.hour;
-    scheduled_tm.tm_min = task.minute;
-    scheduled_tm.tm_sec = 0;
-    mktime(&scheduled_tm); // Normalize
-    Serial.println("Warning: Task " + String(task.id) + " has no valid run day in next 7 days, or days=0. Defaulting to 1 week."); // TODO: AppLogger
-    return mktime(&scheduled_tm);
+    // If the loop completes, it means no suitable day was found within the next 7-8 days.
+    // This should ideally not happen if task.days is valid and > 0.
+    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task %d: calculateNextRunTime could not find a valid next run day within 7 days, despite task.days=0x%02X. Setting next_run to 0.", task.id, task.days);
+    return 0; // Signifies no valid next run time could be determined
 }
 
 // Converts a JSON array of day numbers (1-7, Mon-Sun or Sun-Sat depending on input convention)

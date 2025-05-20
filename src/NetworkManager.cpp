@@ -1,7 +1,13 @@
 #include "../include/NetworkManager.h"
 #include "../include/Logger.h"
+#include <vector> // Required for std::vector
 
-NetworkManager::NetworkManager() : _timeClient(_ntpUDP, "pool.ntp.org", 7 * 3600) { // GMT+7 for Vietnam
+// Make ntpServerList from main.cpp accessible
+extern std::vector<const char*> ntpServerList;
+// Make TZ_INFO from main.cpp accessible
+extern const char* TZ_INFO;
+
+NetworkManager::NetworkManager() : _timeClient(_ntpUDP) { // Server set dynamically in syncTime, default offset for consistency
     _wifiConnected = false;
     _mqttConnected = false;
     _timeSync = false;
@@ -262,38 +268,66 @@ bool NetworkManager::isAttemptingMqttReconnect() const { return _isAttemptingMqt
 int NetworkManager::getMqttState() { return _mqttClient.state(); }
 
 bool NetworkManager::syncTime() {
-    if(!_wifiConnected) {
-        AppLogger.warning("NetMgr", "Cannot sync time, WiFi not connected.");
-        return false;
-    }
     AppLogger.info("NetMgr", "Attempting NTP time synchronization...");
-    int retries = 0;
-    // Ensure NTP client is started. _timeClient.update() can return true even if time isn't yet valid after boot.
-    // _timeClient.forceUpdate() is blocking. We check time(nullptr) for a reasonable Unix timestamp.
-    _timeClient.begin(); 
+    int retries_per_server = 10; // Increased retries
+    bool sync_success = false;
 
-    while(time(nullptr) < 1000000000L && retries < 5) { // Check if time is a plausible Unix epoch time
-        _timeClient.forceUpdate(); // Blocking call to fetch time
-        AppLogger.logf(LOG_LEVEL_DEBUG, "NetMgr", "NTP forceUpdate, current epoch: %lu", (unsigned long)time(nullptr));
-        delay(1000); // Wait for network and NTP response
-        retries++;
+    for (const char* current_ntp_server : ntpServerList) {
+        AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Attempting to sync with NTP server: %s", current_ntp_server);
+        
+        _timeClient.setPoolServerName(current_ntp_server); 
+        _timeClient.begin();
+        // Configure system for an initial attempt to get UTC (offset 0)
+        configTime(0, 0, current_ntp_server);
+
+        for (int attempt = 0; attempt < retries_per_server; ++attempt) {
+            AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "NTP sync with %s (Attempt %d/%d) for UTC. Current epoch: %lu", 
+                           current_ntp_server, attempt + 1, retries_per_server, (unsigned long)time(nullptr));
+            
+            bool packet_exchange_success = _timeClient.forceUpdate(); 
+            
+            AppLogger.logf(LOG_LEVEL_DEBUG, "NetMgr", "NTP forceUpdate with %s attempt done (Packet exchange: %s). Current epoch: %lu", 
+                           current_ntp_server, packet_exchange_success ? "success" : "failed", (unsigned long)time(nullptr));
+
+            if (packet_exchange_success) {
+                // If forceUpdate succeeded (got a response), give a brief moment for system time to potentially update
+                delay(200); // Small delay for SNTP to process
+            }
+
+            if (time(nullptr) > 1000000000L) { // System clock has a valid UTC epoch
+                AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "UTC time appears synced with %s. Raw Epoch: %lu", current_ntp_server, (unsigned long)time(nullptr));
+                
+                // Now that UTC is set, reconfigure with the correct local timezone offset for Vietnam (GMT+7)
+                // This ensures getLocalTime() used by other parts of the system (or directly) will be correct.
+                configTime(7 * 3600, 0, current_ntp_server); 
+                setenv("TZ", TZ_INFO, 1); // TZ_INFO is from main.cpp
+                tzset(); 
+                AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Successfully applied local timezone (%s) settings after UTC sync.", TZ_INFO);
+                
+                struct tm timeinfo;
+                if(getLocalTime(&timeinfo)){ 
+                    char timeBuffer[50];
+                    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
+                    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Current local time after NTP sync: %s", timeBuffer);
+                } else {
+                    AppLogger.error("NetMgr", "getLocalTime() failed after NTP sync.");
+                }
+                _timeSync = true;
+                sync_success = true;
+                break; // Exit retry loop for this server
+            }
+            delay(1000); 
+        }
+        _timeClient.end(); // Stop client for this server
+        if (sync_success) {
+            break; // Exit main server loop if successfully synced
+        }
+        AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "Failed to synchronize with NTP server: %s after %d attempts.", current_ntp_server, retries_per_server);
     }
 
-    if (time(nullptr) > 1000000000L) { // Check if time is now valid
-        // Configure system time using NTP data and set the timezone.
-        // For Vietnam (GMT+7), gmtOffset_sec = 7 * 3600 = 25200. daylightOffset_sec = 0.
-        configTime(7 * 3600, 0, "pool.ntp.org"); 
-        setenv("TZ", "Asia/Ho_Chi_Minh", 1); // Set TimeZone environment variable
-        tzset(); // Apply C library timezone change based on TZ variable
-        AppLogger.info("NetMgr", "NTP time synchronized and timezone set.");
-        struct tm timeinfo;
-        getLocalTime(&timeinfo);
-        AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Current time: %s", asctime(&timeinfo));
-        _timeSync = true;
-        return true;
+    if (!sync_success) {
+        AppLogger.logf(LOG_LEVEL_ERROR, "NetMgr", "NTP time synchronization failed with all configured servers.");
     }
-    
-    AppLogger.error("NetMgr", "NTP time synchronization failed after retries.");
-    _timeSync = false;
-    return false;
+    _timeSync = sync_success;
+    return _timeSync;
 } 

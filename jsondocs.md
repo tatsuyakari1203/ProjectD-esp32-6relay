@@ -47,9 +47,31 @@ ESP32 gửi dữ liệu cảm biến môi trường lên server qua topic này. 
 {
   "api_key": "8a679613-019f-4b88-9068-da10f09dcdd2",
   "timestamp": 1683123456,
-  "temperature": 28.5,
-  "humidity": 65.2,
-  "heat_index": 30.1
+  "device_info": {
+    "name": "esp32_6relay",
+    "type": "DHT21_SoilMoisture",
+    "firmware": "1.0.1"
+  },
+  "temperature": {
+    "value": 28.5,
+    "unit": "celsius",
+    "sensor_type": "temperature"
+  },
+  "humidity": {
+    "value": 65.2,
+    "unit": "percent",
+    "sensor_type": "humidity"
+  },
+  "heat_index": {
+    "value": 30.1,
+    "unit": "celsius",
+    "sensor_type": "heat_index"
+  },
+  "soil_moisture": {
+    "value": 29.0,
+    "unit": "percent",
+    "sensor_type": "capacitive_soil_moisture"
+  }
 }
 ```
 
@@ -57,9 +79,26 @@ ESP32 gửi dữ liệu cảm biến môi trường lên server qua topic này. 
 |--------|------|-------|
 | `api_key` | string | API key xác thực |
 | `timestamp` | number | Thời gian unix timestamp |
-| `temperature` | float | Nhiệt độ (°C) |
-| `humidity` | float | Độ ẩm không khí (%) |
-| `heat_index` | float | Chỉ số nhiệt (°C) |
+| `device_info` | object | Thông tin về thiết bị và firmware |
+| `device_info.name` | string | Tên định danh thiết bị (ví dụ: "esp32_6relay") |
+| `device_info.type` | string | Loại cảm biến/module (ví dụ: "DHT21_SoilMoisture") |
+| `device_info.firmware` | string | Phiên bản firmware (ví dụ: "1.0.1") |
+| `temperature` | object | Dữ liệu nhiệt độ |
+| `temperature.value` | float | Giá trị nhiệt độ |
+| `temperature.unit` | string | Đơn vị nhiệt độ (ví dụ: "celsius") |
+| `temperature.sensor_type` | string | Loại cảm biến nhiệt độ |
+| `humidity` | object | Dữ liệu độ ẩm không khí |
+| `humidity.value` | float | Giá trị độ ẩm |
+| `humidity.unit` | string | Đơn vị độ ẩm (ví dụ: "percent") |
+| `humidity.sensor_type` | string | Loại cảm biến độ ẩm |
+| `heat_index` | object | Dữ liệu chỉ số nhiệt |
+| `heat_index.value` | float | Giá trị chỉ số nhiệt |
+| `heat_index.unit` | string | Đơn vị chỉ số nhiệt (ví dụ: "celsius") |
+| `heat_index.sensor_type` | string | Loại cảm biến chỉ số nhiệt |
+| `soil_moisture` | object | Dữ liệu độ ẩm đất |
+| `soil_moisture.value` | float | Giá trị độ ẩm đất |
+| `soil_moisture.unit` | string | Đơn vị độ ẩm đất (ví dụ: "percent") |
+| `soil_moisture.sensor_type` | string | Loại cảm biến độ ẩm đất (ví dụ: "capacitive_soil_moisture") |
 
 ### 2. Điều khiển relay (`irrigation/esp32_6relay/control`)
 
