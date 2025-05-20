@@ -1,90 +1,125 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Logger.h"
+#include <Arduino.h> // For millis()
 
 // File-scope constant for day names, used in logging
 static const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& envManager) 
+TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& envManager)
     : _relayManager(relayManager), _envManager(envManager) {
     _mutex = xSemaphoreCreateMutex();
+    if (_mutex == NULL) {
+        Serial.println("FATAL ERROR: Failed to create TaskScheduler mutex!");
+        // Consider ESP.restart() or other critical error handling
+    }
     _lastCheckTime = 0;
     _scheduleStatusChanged = false;
+    _earliestNextCheckTime = 0; // Initialize
 }
 
 void TaskScheduler::begin() {
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
         _tasks.clear();
-        _activeZonesBits.reset(); 
-        _earliestNextCheckTime = 0; 
-        _scheduleStatusChanged = true;
-        AppLogger.info("TaskSched", "TaskScheduler initialized");
+        _activeZonesBits.reset();
+        _earliestNextCheckTime = 0;
+        _scheduleStatusChanged = true; // Indicate status needs to be sent
+        AppLogger.info("TaskSched", "TaskScheduler initialized and tasks cleared.");
+        recomputeEarliestNextCheckTime(); // Compute initial check time
         xSemaphoreGive(_mutex);
+    } else {
+        AppLogger.error("TaskSched", "Failed to take mutex in begin()");
     }
 }
 
 bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task_param) {
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        IrrigationTask task = task_param; // Work with a copy to set new defaults if needed
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
+        IrrigationTask task_to_process = task_param; // Work with a copy
 
         auto it = std::find_if(_tasks.begin(), _tasks.end(),
-                              [&task](const IrrigationTask& t) { return t.id == task.id; });
-        
-        if (it != _tasks.end()) {
-            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Updating task ID: %d. Previous state: %d, New active: %s", task.id, it->state, task.active ? "true" : "false");
-            
-            // Preserve runtime state if task is being updated but not fundamentally changed in a way that requires reset
-            task.state = it->state;
-            task.start_time = it->start_time;
-            task.remaining_duration_on_pause_ms = it->remaining_duration_on_pause_ms;
-            task.is_resuming_from_pause = it->is_resuming_from_pause;
+                              [&task_to_process](const IrrigationTask& t) { return t.id == task_to_process.id; });
 
-            if (it->state == RUNNING && !task.active) {
-                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task ID: %d was RUNNING and is being deactivated. Stopping relays.", task.id);
-                stopTask(*it); // Stop based on the *old* task's zone configuration
-                it->state = IDLE; // Set to IDLE as it's deactivated
+        if (it != _tasks.end()) { // Task exists, update it
+            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Updating task ID: %d. Current state: %d, New active: %s", it->id, it->state, task_to_process.active ? "true" : "false");
+
+            TaskState old_state = it->state;
+            time_t old_start_time = it->start_time;
+            unsigned long old_remaining_duration = it->remaining_duration_on_pause_ms;
+            bool old_is_resuming = it->is_resuming_from_pause;
+
+            // If the task was RUNNING and is now being deactivated
+            if (old_state == RUNNING && !task_to_process.active) {
+                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task ID: %d was RUNNING and is being deactivated. Stopping relays.", it->id);
+                stopTask(*it); // Stop using the existing task's zone info
+                // Update the iterator directly, as task_to_process doesn't have the correct runtime context for stopTask
+                it->state = IDLE;
+                it->is_resuming_from_pause = false;
+                it->remaining_duration_on_pause_ms = 0;
+                 // Apply other properties from task_to_process to 'it'
+                it->active = task_to_process.active;
+                it->days = task_to_process.days;
+                it->hour = task_to_process.hour;
+                it->minute = task_to_process.minute;
+                it->duration = task_to_process.duration;
+                it->zones = task_to_process.zones;
+                it->priority = task_to_process.priority;
+                it->preemptable = task_to_process.preemptable;
+                it->sensor_condition = task_to_process.sensor_condition;
+
+            } else { // Preserve runtime state if not deactivating a running task, then apply update
+                task_to_process.state = old_state;
+                task_to_process.start_time = old_start_time;
+                task_to_process.remaining_duration_on_pause_ms = old_remaining_duration;
+                task_to_process.is_resuming_from_pause = old_is_resuming;
+                *it = task_to_process; // Apply the update
             }
-            
-            *it = task; // Apply the update
-            
+
+
+            // Recalculate next_run and adjust state if needed based on new 'active' status
             if (it->active) {
                  it->next_run = calculateNextRunTime(*it);
-            } else {
+            } else { // Task is being made inactive (or was already inactive and re-confirmed)
                 it->next_run = 0;
-                if (it->state != IDLE && it->state != COMPLETED) { // If it was RUNNING (handled above), PAUSED, or WAITING
-                    if (it->state == RUNNING || it->state == PAUSED) { // If it was running or paused, ensure relays are off
-                        stopTask(*it); // This also clears zone bits
-                    }
-                    it->state = IDLE; 
+                if (it->state == PAUSED || it->state == WAITING) { // If it was PAUSED or WAITING, and now inactive
+                    if (it->state == PAUSED) stopTask(*it); // Ensure relays are off if it was PAUSED
+                    it->state = IDLE;
                 }
+                // If it was RUNNING and deactivated, state is already IDLE from above.
+                // If it was COMPLETED, it remains COMPLETED and inactive.
+                // If it was IDLE, it remains IDLE and inactive.
             }
             AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Updated irrigation task ID: %d. New next_run: %lu, Active: %s, State: %d", it->id, (unsigned long)it->next_run, it->active ? "true" : "false", it->state);
-        } else {
-            // Add new task - task_param already has defaults from constructor or JSON parsing
-            _tasks.push_back(task);
-            IrrigationTask& newTaskRef = _tasks.back(); // Get a reference to the task in the vector
-            newTaskRef.state = IDLE; // New tasks start as IDLE.
+        } else { // Task does not exist, add it as new
+            _tasks.push_back(task_to_process);
+            IrrigationTask& newTaskRef = _tasks.back();
+            newTaskRef.state = IDLE;
             newTaskRef.start_time = 0;
-            newTaskRef.next_run = calculateNextRunTime(newTaskRef);
-            
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Added new irrigation task ID: %d, preemptable: %s", task.id, task.preemptable ? "true" : "false");
+            newTaskRef.is_resuming_from_pause = false;
+            newTaskRef.remaining_duration_on_pause_ms = 0;
+            if (newTaskRef.active) {
+                newTaskRef.next_run = calculateNextRunTime(newTaskRef);
+            } else {
+                newTaskRef.next_run = 0;
+            }
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Added new irrigation task ID: %d, preemptable: %s, next_run: %lu", newTaskRef.id, newTaskRef.preemptable ? "true" : "false", (unsigned long)newTaskRef.next_run);
         }
-        
+
         _scheduleStatusChanged = true;
         recomputeEarliestNextCheckTime();
-        
         xSemaphoreGive(_mutex);
         return true;
     }
+    AppLogger.error("TaskSched", "Failed to take mutex in addOrUpdateTask");
     return false;
 }
 
 bool TaskScheduler::deleteTask(int taskId) {
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
         auto it = std::find_if(_tasks.begin(), _tasks.end(),
                               [taskId](const IrrigationTask& t) { return t.id == taskId; });
-        
+
         if (it != _tasks.end()) {
-            if (it->state == RUNNING || it->state == PAUSED) { // If running or paused, stop it and free resources
+            if (it->state == RUNNING || it->state == PAUSED) {
+                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task ID: %d is %s and being deleted. Stopping relays.", taskId, it->state == RUNNING ? "RUNNING" : "PAUSED");
                 stopTask(*it);
             }
             _tasks.erase(it);
@@ -95,6 +130,8 @@ bool TaskScheduler::deleteTask(int taskId) {
             return true;
         }
         xSemaphoreGive(_mutex);
+    } else {
+        AppLogger.error("TaskSched", "Failed to take mutex in deleteTask");
     }
     AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task ID not found for deletion: %d", taskId);
     return false;
@@ -104,30 +141,27 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
     StaticJsonDocument<2048> doc;
     doc["api_key"] = apiKey;
     doc["timestamp"] = (uint32_t)time(NULL);
-    JsonArray tasks = doc.createNestedArray("tasks");
-    
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        for (const auto& task : _tasks) {
-            JsonObject taskObj = tasks.createNestedObject();
-            taskObj["id"] = task.id;
-            taskObj["active"] = task.active;
-            
-            JsonArray days = bitmapToDaysArray(doc, task.days);
+    JsonArray tasks_array = doc.createNestedArray("tasks");
+
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
+        for (const auto& task_item : _tasks) {
+            JsonObject taskObj = tasks_array.createNestedObject();
+            taskObj["id"] = task_item.id;
+            taskObj["active"] = task_item.active;
+            JsonArray days = bitmapToDaysArray(doc, task_item.days);
             taskObj["days"] = days;
-            
             char timeStr[6];
-            sprintf(timeStr, "%02d:%02d", task.hour, task.minute);
+            sprintf(timeStr, "%02d:%02d", task_item.hour, task_item.minute);
             taskObj["time"] = timeStr;
-            taskObj["duration"] = task.duration;
-            
+            taskObj["duration"] = task_item.duration;
             JsonArray zones = taskObj.createNestedArray("zones");
-            for (uint8_t zone : task.zones) {
+            for (uint8_t zone : task_item.zones) {
                 zones.add(zone);
             }
-            taskObj["priority"] = task.priority;
-            taskObj["preemptable"] = task.preemptable; // Serialize new field
-            
-            switch (task.state) {
+            taskObj["priority"] = task_item.priority;
+            taskObj["preemptable"] = task_item.preemptable;
+
+            switch (task_item.state) {
                 case IDLE: taskObj["state"] = "idle"; break;
                 case RUNNING: taskObj["state"] = "running"; break;
                 case COMPLETED: taskObj["state"] = "completed"; break;
@@ -135,25 +169,30 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
                 case WAITING: taskObj["state"] = "waiting"; break;
             }
 
-            if (task.state == PAUSED) {
-                taskObj["remaining_duration_ms"] = task.remaining_duration_on_pause_ms;
+            if (task_item.state == PAUSED || (task_item.state == RUNNING && task_item.is_resuming_from_pause)) {
+                taskObj["remaining_duration_ms"] = task_item.remaining_duration_on_pause_ms;
             }
-            
-            if (task.next_run > 0) {
+            if (task_item.is_resuming_from_pause && task_item.state == RUNNING) { // Only set is_resuming if actually running and resuming
+                taskObj["is_resuming"] = true;
+            }
+
+            if (task_item.next_run > 0) {
                 char next_run_str[25];
                 struct tm next_timeinfo;
-                localtime_r(&task.next_run, &next_timeinfo); // Use localtime_r
+                localtime_r(&task_item.next_run, &next_timeinfo);
                 strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
                 taskObj["next_run"] = next_run_str;
             } else {
                 taskObj["next_run"] = nullptr;
             }
-            
-            if (task.sensor_condition.enabled) {
-                addSensorConditionToJson(doc, taskObj, task.sensor_condition);
+
+            if (task_item.sensor_condition.enabled) {
+                addSensorConditionToJson(doc, taskObj, task_item.sensor_condition);
             }
         }
         xSemaphoreGive(_mutex);
+    } else {
+        AppLogger.error("TaskSched", "Failed to take mutex in getTasksJson");
     }
     String jsonString;
     serializeJson(doc, jsonString);
@@ -163,539 +202,445 @@ String TaskScheduler::getTasksJson(const char* apiKey) {
 void TaskScheduler::addSensorConditionToJson(JsonDocument& doc, JsonObject& taskObj, const SensorCondition& condition) {
     JsonObject sensorCondition = taskObj.createNestedObject("sensor_condition");
     sensorCondition["enabled"] = condition.enabled;
-    
-    // Temperature condition.
+
+    JsonObject temp_cond = sensorCondition.createNestedObject("temperature");
+    temp_cond["enabled"] = condition.temperature_check;
     if (condition.temperature_check) {
-        JsonObject temp = sensorCondition.createNestedObject("temperature");
-        temp["enabled"] = true;
-        temp["min"] = condition.min_temperature;
-        temp["max"] = condition.max_temperature;
-    } else {
-        JsonObject temp = sensorCondition.createNestedObject("temperature");
-        temp["enabled"] = false;
+        temp_cond["min"] = condition.min_temperature;
+        temp_cond["max"] = condition.max_temperature;
     }
-    
-    // Humidity condition.
+
+    JsonObject humidity_cond = sensorCondition.createNestedObject("humidity");
+    humidity_cond["enabled"] = condition.humidity_check;
     if (condition.humidity_check) {
-        JsonObject humidity = sensorCondition.createNestedObject("humidity");
-        humidity["enabled"] = true;
-        humidity["min"] = condition.min_humidity;
-        humidity["max"] = condition.max_humidity;
-    } else {
-        JsonObject humidity = sensorCondition.createNestedObject("humidity");
-        humidity["enabled"] = false;
+        humidity_cond["min"] = condition.min_humidity;
+        humidity_cond["max"] = condition.max_humidity;
     }
-    
-    // Soil moisture condition.
+
+    JsonObject soil_cond = sensorCondition.createNestedObject("soil_moisture");
+    soil_cond["enabled"] = condition.soil_moisture_check;
     if (condition.soil_moisture_check) {
-        JsonObject moisture = sensorCondition.createNestedObject("soil_moisture");
-        moisture["enabled"] = true;
-        moisture["min"] = condition.min_soil_moisture;
-    } else {
-        JsonObject moisture = sensorCondition.createNestedObject("soil_moisture");
-        moisture["enabled"] = false;
+        soil_cond["min"] = condition.min_soil_moisture;
     }
-    
-    // Rain condition.
+
+    JsonObject rain_cond = sensorCondition.createNestedObject("rain");
+    rain_cond["enabled"] = condition.rain_check;
     if (condition.rain_check) {
-        JsonObject rain = sensorCondition.createNestedObject("rain");
-        rain["enabled"] = true;
-        rain["skip_when_raining"] = condition.skip_when_raining;
-    } else {
-        JsonObject rain = sensorCondition.createNestedObject("rain");
-        rain["enabled"] = false;
+        rain_cond["skip_when_raining"] = condition.skip_when_raining;
     }
-    
-    // Light condition.
+
+    JsonObject light_cond = sensorCondition.createNestedObject("light");
+    light_cond["enabled"] = condition.light_check;
     if (condition.light_check) {
-        JsonObject light = sensorCondition.createNestedObject("light");
-        light["enabled"] = true;
-        light["min"] = condition.min_light;
-        light["max"] = condition.max_light;
-    } else {
-        JsonObject light = sensorCondition.createNestedObject("light");
-        light["enabled"] = false;
+        light_cond["min"] = condition.min_light;
+        light_cond["max"] = condition.max_light;
     }
 }
 
 bool TaskScheduler::processCommand(const char* json) {
-    DynamicJsonDocument doc(2048); // Increased size slightly for new fields
+    DynamicJsonDocument doc(2048);
     DeserializationError error = deserializeJson(doc, json);
-    
+
     if (error) {
-        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed: %s", error.c_str());
+        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed for command: %s", error.c_str());
         return false;
     }
-    
+
     if (doc.containsKey("delete_tasks")) {
         return processDeleteCommand(json);
     }
-    
+
     if (!doc.containsKey("tasks")) {
-        AppLogger.error("TaskSched", "Missing 'tasks' field in command");
+        AppLogger.error("TaskSched", "Command missing 'tasks' field");
         return false;
     }
-    
+
     JsonArray tasksArray = doc["tasks"];
-    bool anyChanges = false;
-    
+    if (tasksArray.isNull() || tasksArray.size() == 0) {
+        AppLogger.warning("TaskSched", "'tasks' array is null or empty in command.");
+        return false;
+    }
+
+    bool anyChangesMade = false;
     for (JsonObject taskJson : tasksArray) {
         if (!taskJson.containsKey("id") || !taskJson.containsKey("active") ||
             !taskJson.containsKey("days") || !taskJson.containsKey("time") ||
             !taskJson.containsKey("duration") || !taskJson.containsKey("zones")) {
-            AppLogger.error("TaskSched", "Missing required fields in task object");
+            AppLogger.error("TaskSched", "Task object missing required fields. Skipping.");
             continue;
         }
-        
-        IrrigationTask task; // Uses constructor for defaults
-        task.id = taskJson["id"];
-        task.active = taskJson["active"];
-        task.days = daysArrayToBitmap(taskJson["days"]);
-        
+
+        IrrigationTask task_from_json;
+        task_from_json.id = taskJson["id"];
+        task_from_json.active = taskJson["active"];
+        task_from_json.days = daysArrayToBitmap(taskJson["days"]);
         String timeStr = taskJson["time"].as<String>();
         int separator = timeStr.indexOf(':');
-        if (separator > 0) {
-            task.hour = timeStr.substring(0, separator).toInt();
-            task.minute = timeStr.substring(separator + 1).toInt();
+        if (separator > 0 && timeStr.length() > separator) {
+            task_from_json.hour = timeStr.substring(0, separator).toInt();
+            task_from_json.minute = timeStr.substring(separator + 1).toInt();
         } else {
-            task.hour = 0; task.minute = 0;
+            AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Invalid time format for task %d: %s. Defaulting to 00:00.", task_from_json.id, timeStr.c_str());
+            task_from_json.hour = 0; task_from_json.minute = 0;
         }
-        
-        task.duration = taskJson["duration"];
-        
+        task_from_json.duration = taskJson["duration"];
         JsonArray zonesArray = taskJson["zones"];
-        task.zones.clear();
+        task_from_json.zones.clear();
         for (JsonVariant zone : zonesArray) {
-            task.zones.push_back(zone.as<uint8_t>());
+            task_from_json.zones.push_back(zone.as<uint8_t>());
         }
-        
-        task.priority = taskJson.containsKey("priority") ? taskJson["priority"] : 5;
-        task.preemptable = taskJson.containsKey("preemptable") ? taskJson["preemptable"].as<bool>() : true; // Default to true
-        
-        // Sensor conditions
-        task.sensor_condition.enabled = false; // Default
+        task_from_json.priority = taskJson.containsKey("priority") ? taskJson["priority"].as<uint8_t>() : 5;
+        task_from_json.preemptable = taskJson.containsKey("preemptable") ? taskJson["preemptable"].as<bool>() : true;
+        task_from_json.sensor_condition.enabled = false;
         if (taskJson.containsKey("sensor_condition")) {
-            JsonObject sensorCondition = taskJson["sensor_condition"];
-            parseSensorCondition(sensorCondition, task.sensor_condition);
+            JsonObject sensorConditionJson = taskJson["sensor_condition"];
+            parseSensorCondition(sensorConditionJson, task_from_json.sensor_condition);
         }
-        
-        // state, start_time, next_run, remaining_duration_on_pause_ms, is_resuming_from_pause
-        // are handled by addOrUpdateTask logic or default constructor.
-        
-        if (addOrUpdateTask(task)) { // Pass the fully constructed task
-            anyChanges = true;
+        if (addOrUpdateTask(task_from_json)) {
+            anyChangesMade = true;
         }
     }
-    
-    if (anyChanges) {
-        _scheduleStatusChanged = true;
-        recomputeEarliestNextCheckTime();
-    }
-    return anyChanges;
+    return anyChangesMade;
 }
 
 void TaskScheduler::parseSensorCondition(JsonObject& jsonCondition, SensorCondition& condition) {
     condition.enabled = jsonCondition.containsKey("enabled") ? jsonCondition["enabled"].as<bool>() : false;
-    
     if (!condition.enabled) {
-        return; // No further parsing if conditions are globally disabled.
+        condition.temperature_check = false;
+        condition.humidity_check = false;
+        condition.soil_moisture_check = false;
+        condition.rain_check = false;
+        condition.light_check = false;
+        return;
     }
-    
-    // Temperature condition.
+    condition.temperature_check = false;
     if (jsonCondition.containsKey("temperature")) {
-        JsonObject temp = jsonCondition["temperature"];
-        condition.temperature_check = temp.containsKey("enabled") ? temp["enabled"].as<bool>() : false;
+        JsonObject temp_json = jsonCondition["temperature"];
+        condition.temperature_check = temp_json.containsKey("enabled") ? temp_json["enabled"].as<bool>() : false;
         if (condition.temperature_check) {
-            condition.min_temperature = temp.containsKey("min") ? temp["min"].as<float>() : 0.0;
-            condition.max_temperature = temp.containsKey("max") ? temp["max"].as<float>() : 50.0;
+            condition.min_temperature = temp_json.containsKey("min") ? temp_json["min"].as<float>() : 0.0f;
+            condition.max_temperature = temp_json.containsKey("max") ? temp_json["max"].as<float>() : 50.0f;
         }
     }
-    
-    // Humidity condition.
+    condition.humidity_check = false;
     if (jsonCondition.containsKey("humidity")) {
-        JsonObject humidity = jsonCondition["humidity"];
-        condition.humidity_check = humidity.containsKey("enabled") ? humidity["enabled"].as<bool>() : false;
+        JsonObject humidity_json = jsonCondition["humidity"];
+        condition.humidity_check = humidity_json.containsKey("enabled") ? humidity_json["enabled"].as<bool>() : false;
         if (condition.humidity_check) {
-            condition.min_humidity = humidity.containsKey("min") ? humidity["min"].as<float>() : 0.0;
-            condition.max_humidity = humidity.containsKey("max") ? humidity["max"].as<float>() : 100.0;
+            condition.min_humidity = humidity_json.containsKey("min") ? humidity_json["min"].as<float>() : 0.0f;
+            condition.max_humidity = humidity_json.containsKey("max") ? humidity_json["max"].as<float>() : 100.0f;
         }
     }
-    
-    // Soil moisture condition.
+    condition.soil_moisture_check = false;
     if (jsonCondition.containsKey("soil_moisture")) {
-        JsonObject moisture = jsonCondition["soil_moisture"];
-        condition.soil_moisture_check = moisture.containsKey("enabled") ? moisture["enabled"].as<bool>() : false;
+        JsonObject soil_json = jsonCondition["soil_moisture"];
+        condition.soil_moisture_check = soil_json.containsKey("enabled") ? soil_json["enabled"].as<bool>() : false;
         if (condition.soil_moisture_check) {
-            condition.min_soil_moisture = moisture.containsKey("min") ? moisture["min"].as<float>() : 30.0;
+            condition.min_soil_moisture = soil_json.containsKey("min") ? soil_json["min"].as<float>() : 30.0f;
         }
     }
-    
-    // Rain condition.
+    condition.rain_check = false;
     if (jsonCondition.containsKey("rain")) {
-        JsonObject rain = jsonCondition["rain"];
-        condition.rain_check = rain.containsKey("enabled") ? rain["enabled"].as<bool>() : false;
+        JsonObject rain_json = jsonCondition["rain"];
+        condition.rain_check = rain_json.containsKey("enabled") ? rain_json["enabled"].as<bool>() : false;
         if (condition.rain_check) {
-            condition.skip_when_raining = rain.containsKey("skip_when_raining") ? rain["skip_when_raining"].as<bool>() : true;
+            condition.skip_when_raining = rain_json.containsKey("skip_when_raining") ? rain_json["skip_when_raining"].as<bool>() : true;
         }
     }
-    
-    // Light condition.
+    condition.light_check = false;
     if (jsonCondition.containsKey("light")) {
-        JsonObject light = jsonCondition["light"];
-        condition.light_check = light.containsKey("enabled") ? light["enabled"].as<bool>() : false;
+        JsonObject light_json = jsonCondition["light"];
+        condition.light_check = light_json.containsKey("enabled") ? light_json["enabled"].as<bool>() : false;
         if (condition.light_check) {
-            condition.min_light = light.containsKey("min") ? light["min"].as<int>() : 0;
-            condition.max_light = light.containsKey("max") ? light["max"].as<int>() : 50000;
+            condition.min_light = light_json.containsKey("min") ? light_json["min"].as<int>() : 0;
+            condition.max_light = light_json.containsKey("max") ? light_json["max"].as<int>() : 50000;
         }
     }
 }
 
 bool TaskScheduler::processDeleteCommand(const char* json) {
-    DynamicJsonDocument doc(1024); // Adjust size if many IDs can be deleted at once.
+    DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, json);
-    
     if (error) {
-        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed for delete command: %s", error.c_str());
+        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "JSON parsing failed for delete cmd: %s", error.c_str());
         return false;
     }
-    
-    // Expects a "delete_tasks" array field containing task IDs.
-    if (!doc.containsKey("delete_tasks")) {
-        AppLogger.error("TaskSched", "Missing 'delete_tasks' field in delete command.");
+    if (!doc.containsKey("delete_tasks") || !doc["delete_tasks"].is<JsonArray>()) {
+        AppLogger.error("TaskSched", "Delete command missing 'delete_tasks' array.");
         return false;
     }
-    
     JsonArray deleteTasksArray = doc["delete_tasks"];
-    bool anyDeleted = false; // Tracks if at least one task was successfully deleted.
-    
-    // Delete each task specified by ID in the array.
-    for (JsonVariant taskId : deleteTasksArray) {
-        if (deleteTask(taskId.as<int>())) {
-            anyDeleted = true;
+    bool anyTaskDeleted = false;
+    for (JsonVariant taskId_var : deleteTasksArray) {
+        if (taskId_var.is<int>()) {
+            if (deleteTask(taskId_var.as<int>())) {
+                anyTaskDeleted = true;
+            }
+        } else {
+            AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Invalid task ID type in delete_tasks array: %s", taskId_var.as<String>().c_str());
         }
     }
-    
-    return anyDeleted;
+    return anyTaskDeleted;
 }
 
 void TaskScheduler::update() {
     unsigned long currentMillis = millis();
-    if (currentMillis - _lastCheckTime < 1000) { // Rate limit
+    if (currentMillis - _lastCheckTime < 1000) {
         return;
     }
     _lastCheckTime = currentMillis;
 
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        time_t now;
-        time(&now);
+    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        time_t now_time;
+        time(&now_time);
         struct tm timeinfo;
-        localtime_r(&now, &timeinfo); // Use localtime_r for thread safety
+        localtime_r(&now_time, &timeinfo);
 
-        bool anyStateChangedThisUpdate = false;
+        bool anyStateChangedThisUpdateCycle = false;
 
-        // Section 1: Process RUNNING tasks for completion
-        for (auto& task : _tasks) {
-            if (task.state == RUNNING) {
-                time_t current_target_duration_seconds; // Use time_t for consistency
-                if (task.is_resuming_from_pause) {
-                    current_target_duration_seconds = task.remaining_duration_on_pause_ms / 1000;
+        for (auto& current_task : _tasks) {
+            if (current_task.id == 1) { // Log for specific task ID 1
+                 AppLogger.logf(LOG_LEVEL_DEBUG, "Task1UpdateChk", "Task 1 - State: %d, is_resuming: %s, start_time: %lu, rem_ms: %lu, now_time: %lu",
+                               current_task.state, current_task.is_resuming_from_pause ? "Y":"N", (unsigned long)current_task.start_time, current_task.remaining_duration_on_pause_ms, (unsigned long)now_time);
+            }
+
+            bool should_check_task_completion = false;
+            time_t target_duration_for_completion_seconds = 0;
+            time_t elapsed_time_seconds = 0;
+
+            if (current_task.state == RUNNING) {
+                should_check_task_completion = true;
+                if (current_task.is_resuming_from_pause) {
+                    target_duration_for_completion_seconds = current_task.remaining_duration_on_pause_ms / 1000;
                 } else {
-                    current_target_duration_seconds = task.duration * 60;
+                    target_duration_for_completion_seconds = current_task.duration * 60;
                 }
-
-                time_t elapsed_seconds = 0;
-                if (now >= task.start_time) { // Should normally always be true for a running task
-                    elapsed_seconds = now - task.start_time;
-                } else {
-                    // This case should ideally not happen if start_time is set correctly.
-                    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSchedChk", "Task %d: now (%lu) < task.start_time (%lu)!", task.id, (unsigned long)now, (unsigned long)task.start_time);
+                if (current_task.start_time > 0 && now_time >= current_task.start_time) {
+                    elapsed_time_seconds = now_time - current_task.start_time;
+                } else if (current_task.start_time == 0 && current_task.state == RUNNING) {
+                     AppLogger.logf(LOG_LEVEL_WARNING, "TaskSchedChk", "Task %d is RUNNING but start_time is 0!", current_task.id);
                 }
+            }
+            else if (current_task.is_resuming_from_pause && current_task.state != COMPLETED && current_task.state != IDLE) {
+                AppLogger.logf(LOG_LEVEL_WARNING, "TaskSchedFix", "Task %d was resuming (is_resuming=true) but state is %d (not RUNNING/COMPLETED/IDLE). Checking completion based on remaining_duration.", current_task.id, current_task.state);
+                should_check_task_completion = true;
+                target_duration_for_completion_seconds = current_task.remaining_duration_on_pause_ms / 1000;
+                if (current_task.start_time > 0 && now_time >= current_task.start_time) {
+                    elapsed_time_seconds = now_time - current_task.start_time;
+                } else if (current_task.start_time == 0 && current_task.is_resuming_from_pause) {
+                    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSchedFix", "Task %d is_resuming_from_pause but start_time is 0!", current_task.id);
+                    should_check_task_completion = false;
+                }
+            }
 
-                // Enhanced Log for debugging completion check
-                
-                if (task.is_resuming_from_pause) { // Only log for task đang resume để giảm nhiễu
-                    char relay_state_str[128] = "Zones: "; // Increased buffer size
-                    if (!task.zones.empty()) {
-                        bool first_zone = true;
-                        for(uint8_t zone_id : task.zones) {
-                            if (zone_id >= 1 && zone_id <= _relayManager.getNumRelays()) { // Assumes getNumRelays exists
-                                if (!first_zone) strcat(relay_state_str, ", ");
-                                strcat(relay_state_str, "Z");
-                                char zone_num_str[4];
-                                sprintf(zone_num_str, "%d", zone_id);
-                                strcat(relay_state_str, zone_num_str);
-                                strcat(relay_state_str, ":");
-                                // strcat(relay_state_str, _relayManager.isOn(zone_id - 1) ? "ON" : "OFF"); // Problematic line
-                                first_zone = false;
-                            }
-                        }
+            if (should_check_task_completion) {
+                 AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg",
+                               "Task %d CompletionCheck: now_time=%lu, start_time=%lu, elapsed=%llds, is_resuming=%s, rem_ms=%lu, target_s=%llds, current_state=%d",
+                               current_task.id, (unsigned long)now_time, (unsigned long)current_task.start_time,
+                               (long long)elapsed_time_seconds, current_task.is_resuming_from_pause ? "TRUE" : "FALSE",
+                               current_task.remaining_duration_on_pause_ms, (long long)target_duration_for_completion_seconds, current_task.state);
+
+                if (current_task.start_time > 0 && elapsed_time_seconds >= target_duration_for_completion_seconds) {
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (resuming: %s, state_at_comp_check: %d) COMPLETED. Elapsed: %llds, Target: %llds. Start: %lu, Now: %lu, RemMS (before stop): %lu",
+                                   current_task.id, current_task.is_resuming_from_pause ? "Y":"N", current_task.state,
+                                   (long long)elapsed_time_seconds, (long long)target_duration_for_completion_seconds,
+                                   (unsigned long)current_task.start_time, (unsigned long)now_time,
+                                   current_task.remaining_duration_on_pause_ms);
+
+                    stopTask(current_task);
+                    current_task.state = COMPLETED;
+                    if (current_task.active) {
+                        current_task.next_run = calculateNextRunTime(current_task);
                     } else {
-                        strcat(relay_state_str, "None");
+                        current_task.next_run = 0;
                     }
-
-                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedChk", "Task %d: RUNNING. Resuming: Y. Elapsed: %llds. Target: %llds. RemMS: %lu. Start: %lu. Now: %lu. %s",
-                                   task.id,
-                                   (long long)(now - task.start_time), // Calculate elapsed here for current state
-                                   (long long)(task.remaining_duration_on_pause_ms / 1000),
-                                   task.remaining_duration_on_pause_ms,
-                                   (unsigned long)task.start_time,
-                                   (unsigned long)now,
-                                   relay_state_str
-                                   );
-                }
-                
-                if (task.id == 1) { // Or some other way to identify the specific task if IDs can change
-                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg",
-                                   "Task %d CompletionCheck: now=%lu, start_time=%lu, elapsed=%llds, is_resuming=%s, rem_ms=%lu, target_s=%llds",
-                                   task.id,
-                                   (unsigned long)now,
-                                   (unsigned long)task.start_time,
-                                   (long long)(now >= task.start_time ? now - task.start_time : -1), // Calculate elapsed here
-                                   task.is_resuming_from_pause ? "TRUE" : "FALSE",
-                                   task.remaining_duration_on_pause_ms,
-                                   (long long)(task.is_resuming_from_pause ? (task.remaining_duration_on_pause_ms / 1000) : (task.duration * 60))
-                                  );
-                }
-
-                if (elapsed_seconds >= current_target_duration_seconds) {
-                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (resuming: %s) COMPLETED. Elapsed: %llds, Target: %llds. Start: %lu, Now: %lu, RemMS: %lu",
-                                   task.id, 
-                                   task.is_resuming_from_pause ? "Y":"N", 
-                                   (long long)elapsed_seconds, 
-                                   (long long)current_target_duration_seconds,
-                                   (unsigned long)task.start_time,
-                                   (unsigned long)now,
-                                   task.remaining_duration_on_pause_ms);
-                    stopTask(task); // Clears bits, resets resume flags
-                    task.state = COMPLETED;
-                    task.next_run = calculateNextRunTime(task);
-                    anyStateChangedThisUpdate = true;
+                    anyStateChangedThisUpdateCycle = true;
                 }
             }
         }
 
-        // Section 2: Try to start IDLE, WAITING tasks or resume PAUSED tasks
         for (auto& task_to_evaluate : _tasks) {
             if (!task_to_evaluate.active) continue;
+            if (task_to_evaluate.state == RUNNING || task_to_evaluate.state == COMPLETED) continue;
 
             bool canProceedWithEvaluation = false;
             if (task_to_evaluate.state == IDLE) {
                 bool isDayMatch = (task_to_evaluate.days & (1 << timeinfo.tm_wday));
                 bool isTimeMatch = (timeinfo.tm_hour == task_to_evaluate.hour && timeinfo.tm_min == task_to_evaluate.minute);
-                if (now >= task_to_evaluate.next_run && task_to_evaluate.next_run != 0) { // Check against next_run time
-                     if (isDayMatch && isTimeMatch) canProceedWithEvaluation = true; // Original time match
-                } else if (isDayMatch && isTimeMatch && (task_to_evaluate.next_run == 0 || now >= task_to_evaluate.next_run ) ) { // Fallback for initial runs or if next_run was 0
-                    canProceedWithEvaluation = true;
+                if ( (task_to_evaluate.next_run != 0 && now_time >= task_to_evaluate.next_run) ||
+                     (task_to_evaluate.next_run == 0 && isDayMatch && isTimeMatch) ) {
+                     if (isDayMatch && isTimeMatch) canProceedWithEvaluation = true;
                 }
-
             } else if (task_to_evaluate.state == WAITING || task_to_evaluate.state == PAUSED) {
                 canProceedWithEvaluation = true;
             }
 
             if (!canProceedWithEvaluation) continue;
 
-            // Sensor conditions check (only for IDLE or WAITING trying to start fresh)
             if (task_to_evaluate.state == IDLE || task_to_evaluate.state == WAITING) {
                 if (!checkSensorConditions(task_to_evaluate)) {
-                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d conditions not met, skipping/remaining WAITING.", task_to_evaluate.id);
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d conditions not met. State: %d -> WAITING. Rescheduling.", task_to_evaluate.id, task_to_evaluate.state);
                     if (task_to_evaluate.state == IDLE) {
-                        task_to_evaluate.state = WAITING; // Move to waiting if conditions fail at scheduled time
-                        task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true); // Mark as skipped
+                        task_to_evaluate.state = WAITING;
+                        anyStateChangedThisUpdateCycle = true;
                     }
-                    anyStateChangedThisUpdate = true;
+                    task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true);
                     continue;
                 }
             }
 
-            // Zone conflict resolution and starting/resuming
-            bool canRunThisTask = true;
-            std::vector<IrrigationTask*> tasksToPauseForThisEvaluation; 
-
-            for (uint8_t zoneId : task_to_evaluate.zones) {
-                IrrigationTask* conflictingTask = getTaskUsingZone(zoneId, task_to_evaluate.id);
-
-                if (conflictingTask) { // Zone is busy (RUNNING or PAUSED)
-                    if (task_to_evaluate.state == PAUSED && conflictingTask->id == task_to_evaluate.id) {
-                        // This is the PAUSED task itself "occupying" its zone, which is fine for resumption check.
-                        // But if another task is *also* in this zone, that's a different conflict.
-                        // getTaskUsingZone should exclude the task_to_evaluate if it's PAUSED.
-                        // Let's refine getTaskUsingZone or ensure PAUSED task isn't seen as conflicting with itself.
-                        // For now, this means a PAUSED task checks if its zone is *still* held by its *own* paused reservation.
-                        // If another task is using it, that's a conflict.
-                        // If zone is busy by *another* task:
-                        // This case is complex: task_to_evaluate is PAUSED, wants to resume, but zone is taken by *another* task.
-                        // For now, PAUSED task will only resume if its zones are free or taken by itself.
-                        continue; // PAUSED task's own reservation is not a conflict for itself
-                    }
-
-
-                    if (task_to_evaluate.priority > conflictingTask->priority) {
-                        if (conflictingTask->preemptable) {
-                            bool alreadyMarked = false;
-                            for(const auto* tp : tasksToPauseForThisEvaluation) if(tp->id == conflictingTask->id) alreadyMarked = true;
-                            if(!alreadyMarked) tasksToPauseForThisEvaluation.push_back(conflictingTask);
-                        } else {
-                            canRunThisTask = false;
-                            if (task_to_evaluate.state != WAITING) { // If IDLE or PAUSED
+            bool canRunThisTaskDueToZoneAvailability = true;
+            std::vector<IrrigationTask*> tasksToPauseForThisAction;
+            for (uint8_t zoneId_to_use : task_to_evaluate.zones) {
+                IrrigationTask* conflictingTaskPtr = getTaskUsingZone(zoneId_to_use, task_to_evaluate.id);
+                if (conflictingTaskPtr) {
+                    if (task_to_evaluate.priority > conflictingTaskPtr->priority) {
+                        if (conflictingTaskPtr->preemptable && conflictingTaskPtr->state == RUNNING) {
+                            bool alreadyMarkedToPause = false;
+                            for(const auto* tp : tasksToPauseForThisAction) if(tp->id == conflictingTaskPtr->id) alreadyMarkedToPause = true;
+                            if(!alreadyMarkedToPause) tasksToPauseForThisAction.push_back(conflictingTaskPtr);
+                        } else if (!conflictingTaskPtr->preemptable || conflictingTaskPtr->state == PAUSED) {
+                            canRunThisTaskDueToZoneAvailability = false;
+                            if (task_to_evaluate.state != WAITING) {
                                 task_to_evaluate.state = WAITING;
-                                task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true); 
+                                task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true);
+                                anyStateChangedThisUpdateCycle = true;
                             }
-                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d) cannot start/resume, zone %u busy with non-preemptable task %d. Setting/keeping WAITING.", task_to_evaluate.id, task_to_evaluate.state, zoneId, conflictingTask->id);
-                            anyStateChangedThisUpdate = true;
-                            break; 
+                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d, prio %d) cannot start/resume, zone %u busy with non-preemptable/paused task %d (prio %d). Setting/keeping WAITING.",
+                                           task_to_evaluate.id, task_to_evaluate.state, task_to_evaluate.priority, zoneId_to_use, conflictingTaskPtr->id, conflictingTaskPtr->priority);
+                            break;
                         }
-                    } else { 
-                        canRunThisTask = false;
+                    } else {
+                        canRunThisTaskDueToZoneAvailability = false;
                         if (task_to_evaluate.state != WAITING) {
                             task_to_evaluate.state = WAITING;
                             task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true);
+                            anyStateChangedThisUpdateCycle = true;
                         }
-                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d) cannot start/resume, zone %u busy with higher/equal priority task %d. Setting/keeping WAITING.", task_to_evaluate.id, task_to_evaluate.state, zoneId, conflictingTask->id);
-                        anyStateChangedThisUpdate = true;
+                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d, prio %d) cannot start/resume, zone %u busy with higher/equal prio task %d (prio %d). Setting/keeping WAITING.",
+                                       task_to_evaluate.id, task_to_evaluate.state, task_to_evaluate.priority, zoneId_to_use, conflictingTaskPtr->id, conflictingTaskPtr->priority);
                         break;
                     }
                 }
-            } // End zone check loop
+            }
 
-            if (canRunThisTask) {
-                for (IrrigationTask* taskToActuallyPause : tasksToPauseForThisEvaluation) {
-                    if (taskToActuallyPause->state == RUNNING) { // Only pause if it's actually running
+            if (canRunThisTaskDueToZoneAvailability) {
+                for (IrrigationTask* taskToActuallyPause : tasksToPauseForThisAction) {
+                    if (taskToActuallyPause->state == RUNNING) {
                        pauseTask(*taskToActuallyPause);
                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d PAUSED by higher priority task %d.", taskToActuallyPause->id, task_to_evaluate.id);
-                        anyStateChangedThisUpdate = true;
+                       anyStateChangedThisUpdateCycle = true;
                     }
                 }
-
-                TaskState state_before_action = task_to_evaluate.state; // Capture state before action
+                TaskState state_before_action = task_to_evaluate.state;
                 if (task_to_evaluate.state == PAUSED) {
-                    resumeTask(task_to_evaluate); 
+                    resumeTask(task_to_evaluate);
                     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d RESUMED.", task_to_evaluate.id);
-                } else { // IDLE or WAITING
-                    startTask(task_to_evaluate); 
+                } else {
+                    startTask(task_to_evaluate);
                     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d STARTED (from %s).", task_to_evaluate.id, (state_before_action == IDLE ? "IDLE" : "WAITING"));
                 }
-                
-                // If the state is now RUNNING (it should be after start/resume) and it changed, or was PAUSED/IDLE/WAITING
-                // then we consider the status changed for reporting purposes.
-                if (task_to_evaluate.state == RUNNING) {
-                    if(state_before_action != RUNNING) { // If it wasn't already running (e.g. IDLE, PAUSED, WAITING)
-                        anyStateChangedThisUpdate = true;
-                    }
-                    // If it was already RUNNING and somehow canRunThisTask was true (e.g. error in logic),
-                    // explicitly setting anyStateChangedThisUpdate might not be needed unless an action (like pausing others) occurred.
-                    // The pausing of other tasks already sets anyStateChangedThisUpdate.
-                } else if (task_to_evaluate.state != state_before_action) {
-                    // If state changed to something other than RUNNING (e.g. resumeTask decided to mark COMPLETED directly)
-                    anyStateChangedThisUpdate = true;
+                if (task_to_evaluate.state != state_before_action) {
+                    anyStateChangedThisUpdateCycle = true;
                 }
             }
-        } // End main task evaluation loop
+        }
 
-        if (anyStateChangedThisUpdate) {
+        if (anyStateChangedThisUpdateCycle) {
             _scheduleStatusChanged = true;
         }
         recomputeEarliestNextCheckTime();
         xSemaphoreGive(_mutex);
+    } else {
+        AppLogger.error("TaskSched", "Failed to take mutex in update()");
     }
 }
 
 bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
-    if (!task.sensor_condition.enabled) {
-        return true; // Sensor conditions are disabled for this task, so it can run.
-    }
-    
+    if (!task.sensor_condition.enabled) return true;
     const SensorCondition& condition = task.sensor_condition;
-    
-    // Temperature check.
     if (condition.temperature_check) {
         float temp = _envManager.getTemperature();
         if (temp < condition.min_temperature || temp > condition.max_temperature) {
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to temperature out of range: %.2f C", task.id, temp);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSensCond", "Task %d skipped: Temp (%.1f) out of range [%.1f, %.1f]", task.id, temp, condition.min_temperature, condition.max_temperature);
             return false;
         }
     }
-    
-    // Air humidity check.
     if (condition.humidity_check) {
         float humidity = _envManager.getHumidity();
         if (humidity < condition.min_humidity || humidity > condition.max_humidity) {
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to humidity out of range: %.2f %%", task.id, humidity);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSensCond", "Task %d skipped: Humidity (%.1f) out of range [%.1f, %.1f]", task.id, humidity, condition.min_humidity, condition.max_humidity);
             return false;
         }
     }
-    
-    // Soil moisture check (checks all zones of the task).
     if (condition.soil_moisture_check) {
         for (uint8_t zoneId : task.zones) {
             float moisture = _envManager.getSoilMoisture(zoneId);
-            if (moisture > condition.min_soil_moisture) { // Assumes task should run if moisture is LOW, so skip if HIGH.
-                AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to soil moisture in zone %u above threshold: %.2f %%", task.id, zoneId, moisture);
+            if (moisture > condition.min_soil_moisture) {
+                AppLogger.logf(LOG_LEVEL_INFO, "TaskSensCond", "Task %d skipped: Zone %d SoilM (%.1f) > min_needed (%.1f)", task.id, zoneId, moisture, condition.min_soil_moisture);
                 return false;
             }
         }
     }
-    
-    // Rain check.
     if (condition.rain_check && condition.skip_when_raining) {
         if (_envManager.isRaining()) {
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to rain", task.id);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSensCond", "Task %d skipped: Raining", task.id);
             return false;
         }
     }
-    
-    // Light level check.
     if (condition.light_check) {
         int light = _envManager.getLightLevel();
         if (light < condition.min_light || light > condition.max_light) {
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d skipped due to light level out of range: %d lux", task.id, light);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSensCond", "Task %d skipped: Light (%d) out of range [%d, %d]", task.id, light, condition.min_light, condition.max_light);
             return false;
         }
     }
-    
-    return true; // All checked conditions are met.
+    return true;
 }
 
 void TaskScheduler::startTask(IrrigationTask& task) {
-    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Attempting to start task %d. Duration: %u mins. Zones: ...", task.id, task.duration);
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Attempting to start task %d. Duration: %u mins.", task.id, task.duration);
     task.start_time = time(NULL);
-    task.is_resuming_from_pause = false; 
-    task.remaining_duration_on_pause_ms = 0; // Ensure this is reset for a fresh start
+    task.is_resuming_from_pause = false;
+    task.remaining_duration_on_pause_ms = 0;
     uint32_t duration_ms = task.duration * 60 * 1000;
-
     String zonesStr = "";
-    for (size_t i = 0; i < task.zones.size(); ++i) {
-        zonesStr += String(task.zones[i]);
-        if (i < task.zones.size() - 1) zonesStr += ", ";
+    if (!task.zones.empty()) {
+        for (size_t i = 0; i < task.zones.size(); ++i) {
+            zonesStr += String(task.zones[i]);
+            if (i < task.zones.size() - 1) zonesStr += ", ";
+        }
+    } else {
+        zonesStr = "None";
     }
     AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d starting with zones: [%s]", task.id, zonesStr.c_str());
-
-
     for (uint8_t zoneId : task.zones) {
-        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
+        if (zoneId >= 1 && zoneId <= (uint8_t)_relayManager.getNumRelays()) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOn(relayIndex, duration_ms);
             _activeZonesBits.set(relayIndex);
         } else {
-            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in startTask for task %d", zoneId, task.id);
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Invalid zoneId %u in startTask for task %d", zoneId, task.id);
         }
     }
-    task.state = RUNNING; // Ensure state is set
+    task.state = RUNNING;
+    _scheduleStatusChanged = true;
 }
 
-void TaskScheduler::stopTask(IrrigationTask& task) { // Called when task COMPLETED or is forcefully stopped/cancelled
+void TaskScheduler::stopTask(IrrigationTask& task) {
     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Stopping task %d (current state %d). Clearing active zones.", task.id, task.state);
     for (uint8_t zoneId : task.zones) {
-        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
+        if (zoneId >= 1 && zoneId <= (uint8_t)_relayManager.getNumRelays()) {
             uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOff(relayIndex);
-            _activeZonesBits.reset(relayIndex); 
+            _activeZonesBits.reset(relayIndex);
         } else {
-            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in stopTask for task %d", zoneId, task.id);
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Invalid zoneId %u in stopTask for task %d", zoneId, task.id);
         }
     }
     task.is_resuming_from_pause = false;
     task.remaining_duration_on_pause_ms = 0;
-    // task.state is typically set to COMPLETED or IDLE by the caller after this.
+    _scheduleStatusChanged = true;
 }
 
 void TaskScheduler::pauseTask(IrrigationTask& task) {
@@ -703,35 +648,36 @@ void TaskScheduler::pauseTask(IrrigationTask& task) {
         AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Attempted to pause task %d but it was not RUNNING (state: %d).", task.id, task.state);
         return;
     }
-
-    time_t now = time(NULL);
-    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg", "PauseTask ID %d: now=%lu, task.start_time=%lu, task.is_resuming_from_pause_before_calc=%s",
-                   task.id, (unsigned long)now, (unsigned long)task.start_time, task.is_resuming_from_pause ? "Y":"N");
-    time_t elapsed_seconds_before_pause = now - task.start_time;
-    
-    uint32_t original_duration_seconds_this_run;
-    if (task.is_resuming_from_pause) {
-        original_duration_seconds_this_run = task.remaining_duration_on_pause_ms / 1000;
+    time_t current_time_for_pause = time(NULL);
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg", "PauseTask ID %d: current_time_for_pause=%lu, task.start_time=%lu, task.is_resuming_from_pause_before_calc=%s",
+                   task.id, (unsigned long)current_time_for_pause, (unsigned long)task.start_time, task.is_resuming_from_pause ? "Y":"N");
+    if (task.start_time == 0) {
+        AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Task %d is RUNNING but start_time is 0. Cannot accurately calculate remaining time for pause.", task.id);
+        task.remaining_duration_on_pause_ms = 0;
     } else {
-        original_duration_seconds_this_run = task.duration * 60;
-    }
-    
-    int32_t remaining_sec = original_duration_seconds_this_run - elapsed_seconds_before_pause;
-    task.remaining_duration_on_pause_ms = (remaining_sec > 0) ? (unsigned long)remaining_sec * 1000 : 0;
-
-    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Pausing task %d. Original duration for this run: %u s. Elapsed (calc): %ld s. Stored Remaining MS: %lu ms.",
-                   task.id, original_duration_seconds_this_run, (long)elapsed_seconds_before_pause, task.remaining_duration_on_pause_ms);
-
-    for (uint8_t zoneId : task.zones) {
-        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
-            _relayManager.turnOff(zoneId - 1); 
-            // _activeZonesBits.set(zoneId - 1); // Zone bit remains set to reserve it
+        time_t elapsed_seconds_before_pause = current_time_for_pause - task.start_time;
+        uint32_t original_duration_seconds_this_segment;
+        if (task.is_resuming_from_pause) {
+            original_duration_seconds_this_segment = task.remaining_duration_on_pause_ms / 1000;
         } else {
-            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in pauseTask for task %d", zoneId, task.id);
+            original_duration_seconds_this_segment = task.duration * 60;
+        }
+        if (elapsed_seconds_before_pause < 0) elapsed_seconds_before_pause = 0;
+        int32_t remaining_sec = original_duration_seconds_this_segment - elapsed_seconds_before_pause;
+        task.remaining_duration_on_pause_ms = (remaining_sec > 0) ? (unsigned long)remaining_sec * 1000 : 0;
+        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Pausing task %d. Original duration for this segment: %u s. Elapsed (calc): %ld s. Stored Remaining MS: %lu ms.",
+                    task.id, original_duration_seconds_this_segment, (long)elapsed_seconds_before_pause, task.remaining_duration_on_pause_ms);
+    }
+    for (uint8_t zoneId : task.zones) {
+        if (zoneId >= 1 && zoneId <= (uint8_t)_relayManager.getNumRelays()) {
+            _relayManager.turnOff(zoneId - 1);
+        } else {
+             AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Invalid zoneId %u in pauseTask for task %d", zoneId, task.id);
         }
     }
     task.state = PAUSED;
-    task.is_resuming_from_pause = false; // It's now paused, not resuming. This flag is for when it *becomes* RUNNING again.
+    task.is_resuming_from_pause = false;
+    _scheduleStatusChanged = true;
 }
 
 void TaskScheduler::resumeTask(IrrigationTask& task) {
@@ -741,215 +687,164 @@ void TaskScheduler::resumeTask(IrrigationTask& task) {
     }
     if (task.remaining_duration_on_pause_ms == 0) {
         AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d was PAUSED but has no remaining duration. Marking COMPLETED.", task.id);
-        stopTask(task); // Clear zone bits etc.
+        stopTask(task);
         task.state = COMPLETED;
-        task.next_run = calculateNextRunTime(task);
+        if (task.active) {
+            task.next_run = calculateNextRunTime(task);
+        } else {
+            task.next_run = 0;
+        }
         _scheduleStatusChanged = true;
         return;
     }
-
     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Resuming task %d with %lu ms remaining.", task.id, task.remaining_duration_on_pause_ms);
-    task.start_time = time(NULL); 
-    task.is_resuming_from_pause = true; 
-
+    task.start_time = time(NULL);
+    task.is_resuming_from_pause = true;
     for (uint8_t zoneId : task.zones) {
-        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
-            // _activeZonesBits should already be set for these zones
+        if (zoneId >= 1 && zoneId <= (uint8_t)_relayManager.getNumRelays()) {
             _relayManager.turnOn(zoneId - 1, task.remaining_duration_on_pause_ms);
         } else {
-            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in resumeTask for task %d", zoneId, task.id);
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Invalid zoneId %u in resumeTask for task %d", zoneId, task.id);
         }
     }
     task.state = RUNNING;
+    _scheduleStatusChanged = true;
 }
 
 bool TaskScheduler::isZoneBusy(uint8_t zoneId) {
-    if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
-        // Check _activeZonesBits directly, as this should reflect committed zones
+    if (zoneId >= 1 && zoneId <= (uint8_t)_relayManager.getNumRelays()) {
         return _activeZonesBits.test(zoneId - 1);
     }
-    AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId in isZoneBusy: %u", zoneId);
-    return false;
+    AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Invalid zoneId %u in isZoneBusy", zoneId);
+    return true;
 }
 
 bool TaskScheduler::isHigherPriority(int checkingTaskId, uint8_t conflictingZoneId) {
-    auto checkingTaskIt = std::find_if(_tasks.begin(), _tasks.end(),
-                            [checkingTaskId](const IrrigationTask& t) { return t.id == checkingTaskId; });
-    
-    if (checkingTaskIt == _tasks.end()) return false; // Task to check not found.
-    
-    // Iterate through all tasks to find any RUNNING task that uses the conflictingZoneId.
-    for (const auto& runningTask : _tasks) {
-        if (runningTask.state == RUNNING) {
-            // Check if this runningTask uses the conflictingZoneId.
-            bool usesConflictingZone = false;
-            for (uint8_t zone : runningTask.zones) {
-                if (zone == conflictingZoneId) {
-                    usesConflictingZone = true;
-                    break;
-                }
-            }
-
-            if (usesConflictingZone) {
-                // A running task uses the conflicting zone. Check priority.
-                if (runningTask.priority >= checkingTaskIt->priority) {
-                    return false; // The running task has higher or equal priority.
-                }
-            }
-        }
-    }
-    
-    return true; // No higher or equal priority task is running in the conflicting zone.
+    // This function needs careful review if used. Currently, preemption logic is within update().
+    return true; // Placeholder
 }
 
 time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isRescheduleAfterSkip) {
-    time_t now;
-    time(&now);
-    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d (State: %d, Active: %s), Days: 0x%02X, Time: %02d:%02d, Skip: %s, Current Epoch: %lu", 
-                    task.id, task.state, task.active ? "T" : "F", task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)now);
+    time_t current_epoch_time;
+    time(&current_epoch_time);
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d (State: %d, Active: %s), Days: 0x%02X, Time: %02d:%02d, Skip: %s, Current Epoch: %lu",
+                    task.id, task.state, task.active ? "T" : "F", task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)current_epoch_time);
 
-    if (!task.active) { // If task is inactive, it has no next run time.
+    if (!task.active) {
         AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d is inactive. Setting next_run to 0.", task.id);
         return 0;
     }
-    if (task.days == 0) { // If task has no scheduled days.
-        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d has no scheduled days (days bitmap is 0). Setting next_run to 0.", task.id);
+    if (task.days == 0 && task.state != COMPLETED) {
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d has no scheduled days (days bitmap is 0) and is not COMPLETED. Setting next_run to 0.", task.id);
+        return 0;
+    }
+     if (task.days == 0 && task.state == COMPLETED) { // One-shot task that just completed
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d is a one-shot task that completed. No next run.", task.id);
         return 0;
     }
 
-    struct tm timeinfo_now; 
-    localtime_r(&now, &timeinfo_now);
+    struct tm timeinfo_current_epoch;
+    localtime_r(&current_epoch_time, &timeinfo_current_epoch);
 
-    struct tm scheduled_tm = timeinfo_now; 
-    scheduled_tm.tm_hour = task.hour;
-    scheduled_tm.tm_min = task.minute;
-    scheduled_tm.tm_sec = 0;
-    
-    for (int dayOffset = 0; dayOffset < 8; dayOffset++) { 
-        struct tm nextDayCandidate_tm = timeinfo_now;
-        nextDayCandidate_tm.tm_mday += dayOffset;
-        mktime(&nextDayCandidate_tm); 
-        
+    for (int dayOffset = 0; dayOffset < 8; dayOffset++) {
+        struct tm nextDayCandidate_tm;
+        time_t temp_time = current_epoch_time + (dayOffset * 24L * 60L * 60L);
+        localtime_r(&temp_time, &nextDayCandidate_tm);
+        nextDayCandidate_tm.tm_hour = task.hour;
+        nextDayCandidate_tm.tm_min = task.minute;
+        nextDayCandidate_tm.tm_sec = 0;
+        time_t candidate_run_time = mktime(&nextDayCandidate_tm);
+
         if (task.days & (1 << nextDayCandidate_tm.tm_wday)) {
-            if (dayOffset == 0) {
-                if (!isRescheduleAfterSkip && 
-                    (timeinfo_now.tm_hour > task.hour || (timeinfo_now.tm_hour == task.hour && timeinfo_now.tm_min >= task.minute))) {
-                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Today's (%s) time %02d:%02d has passed or is current. Skipping to next valid day.", task.id, dayNames[nextDayCandidate_tm.tm_wday], task.hour, task.minute);
-                    continue; 
-                }
-            }
-
-            scheduled_tm.tm_year = nextDayCandidate_tm.tm_year;
-            scheduled_tm.tm_mon  = nextDayCandidate_tm.tm_mon;
-            scheduled_tm.tm_mday = nextDayCandidate_tm.tm_mday;
-
-            time_t calculated_time = mktime(&scheduled_tm);
-
-            if (isRescheduleAfterSkip && calculated_time <= now) {
-                 AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Rescheduled time %lu for day %s is still past/present (%lu). Continuing to find future slot.", task.id, (unsigned long)calculated_time, dayNames[nextDayCandidate_tm.tm_wday], (unsigned long)now);
+            if (dayOffset == 0 && !isRescheduleAfterSkip && candidate_run_time < current_epoch_time) {
+                 AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Today's (%s) time %02d:%02d has passed. Checking next valid day.", task.id, dayNames[nextDayCandidate_tm.tm_wday], task.hour, task.minute);
                 continue;
             }
-            
-            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Found next run on %s at %02d:%02d. Epoch: %lu", task.id, dayNames[nextDayCandidate_tm.tm_wday], scheduled_tm.tm_hour, scheduled_tm.tm_min, (unsigned long)calculated_time);
-            return calculated_time;
+            if (isRescheduleAfterSkip && candidate_run_time <= current_epoch_time) {
+                 AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Rescheduled time %lu for day %s is still past/present (%lu). Continuing.", task.id, (unsigned long)candidate_run_time, dayNames[nextDayCandidate_tm.tm_wday], (unsigned long)current_epoch_time);
+                continue;
+            }
+            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Found next run on %s at %02d:%02d. Epoch: %lu", task.id, dayNames[nextDayCandidate_tm.tm_wday], nextDayCandidate_tm.tm_hour, nextDayCandidate_tm.tm_min, (unsigned long)candidate_run_time);
+            return candidate_run_time;
         }
     }
-    
-    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task %d: calculateNextRunTime could not find a valid next run day. Setting next_run to 0.", task.id);
+    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task %d: calculateNextRunTime could not find any valid future run day. Setting next_run to 0.", task.id);
     return 0;
 }
 
 uint8_t TaskScheduler::daysArrayToBitmap(JsonArray daysArray) {
     uint8_t bitmap = 0;
-    
     for (JsonVariant dayVar : daysArray) {
-        int day = dayVar.as<int>(); // e.g., 1 for Monday, 7 for Sunday
-        if (day >= 1 && day <= 7) {
-            // Convert to tm_wday convention (0=Sun, 1=Mon, ..., 6=Sat)
-            // If input 1=Mon,...,7=Sun:  (day % 7) might map 7(Sun) to 0, 1(Mon) to 1, ..., 6(Sat) to 6.
-            // Example: Monday (1) -> (1%7) = 1. Sunday (7) -> (7%7) = 0.
-            int adjustedDay = (day == 7) ? 0 : day; // If 7 means Sunday, map to 0. Else, day is 1-6 (Mon-Sat).
-            bitmap |= (1 << adjustedDay);
+        if (dayVar.is<int>()) {
+            int day = dayVar.as<int>();
+            if (day >= 1 && day <= 7) {
+                int wday_idx = (day == 7) ? 0 : day;
+                bitmap |= (1 << wday_idx);
+            }
         }
     }
-    
     return bitmap;
 }
 
 JsonArray TaskScheduler::bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap) {
     JsonArray array = doc.createNestedArray();
-    const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}; // For mapping if needed, not directly used for 1-7 numbers
-
-    for (int wday_idx = 0; wday_idx <= 6; wday_idx++) { // 0=Sun, 1=Mon, ..., 6=Sat (tm_wday convention)
+    for (int wday_idx = 0; wday_idx <= 6; wday_idx++) {
         if (daysBitmap & (1 << wday_idx)) {
-            // Convert tm_wday index (0-6) back to user-friendly 1-7 (Mon-Sun)
-            // Sunday (0) -> 7. Monday (1) -> 1. ... Saturday (6) -> 6.
             int userDay = (wday_idx == 0) ? 7 : wday_idx;
             array.add(userDay);
         }
     }
-    // Sort the array for consistent output, e.g., [1, 2, 7] for Mon, Tue, Sun.
-    // std::sort can't be directly used on JsonArray. If order matters, collect then add.
     return array;
 }
 
 time_t TaskScheduler::getEarliestNextCheckTime() const {
-    // No mutex needed for simple read by Core0, assuming _earliestNextCheckTime updates are atomic enough for this purpose.
-    // For more complex scenarios or multi-writer, a mutex might be needed here too.
     return _earliestNextCheckTime;
 }
 
 void TaskScheduler::recomputeEarliestNextCheckTime() {
-    _earliestNextCheckTime = 0; // Reset to find the minimum.
-    time_t now_val;
-    time(&now_val);
+    _earliestNextCheckTime = 0;
+    time_t current_time_for_recompute;
+    time(&current_time_for_recompute);
 
-    for (const auto& task : _tasks) {
-        // Consider only active tasks that have a future run time.
-        if (task.active && task.next_run > 0 && task.next_run > now_val) { 
-            if (_earliestNextCheckTime == 0 || task.next_run < _earliestNextCheckTime) {
-                _earliestNextCheckTime = task.next_run;
+    for (const auto& task_item : _tasks) {
+        if (task_item.active && task_item.next_run > 0 && task_item.next_run > current_time_for_recompute) {
+            if (_earliestNextCheckTime == 0 || task_item.next_run < _earliestNextCheckTime) {
+                _earliestNextCheckTime = task_item.next_run;
             }
         }
     }
-    
-    // Fallback if no active future tasks are found.
+
     if (_earliestNextCheckTime == 0) {
-        if (!_tasks.empty()) {
-            // If tasks exist but none are active or scheduled in future, check again in 1 minute.
-             _earliestNextCheckTime = now_val + 60; 
-        } else {
-            // If no tasks at all, check again in 5 minutes (or a longer interval).
-            _earliestNextCheckTime = now_val + 300;
-        }
+        _earliestNextCheckTime = current_time_for_recompute + 60; // Default to check in 1 minute
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "No active future tasks or no tasks. Setting earliestNextCheckTime to 1 min from now: %lu", (unsigned long)_earliestNextCheckTime);
+    } else {
+         AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Recomputed earliestNextCheckTime: %lu", (unsigned long)_earliestNextCheckTime);
     }
 }
 
 bool TaskScheduler::hasScheduleStatusChangedAndReset() {
-    if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        bool changed = _scheduleStatusChanged;
-        _scheduleStatusChanged = false; // Reset the flag after reading.
+    bool changed = false;
+    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        changed = _scheduleStatusChanged;
+        _scheduleStatusChanged = false;
         xSemaphoreGive(_mutex);
-        return changed;
+    } else {
+        // AppLogger.warning("TaskSched", "Failed to take mutex in hasScheduleStatusChangedAndReset, returning true as fallback.");
+        return true; // Fallback if mutex fails, to ensure status might be sent
     }
-    AppLogger.error("TaskSched", "Failed to take mutex in hasScheduleStatusChangedAndReset");
-    return true; // Default to true to ensure status is sent if mutex fails, to be safe.
+    return changed;
 }
 
 IrrigationTask* TaskScheduler::getTaskUsingZone(uint8_t zoneId, int excludeTaskId) {
-    for (auto& task : _tasks) {
-        if (task.id == excludeTaskId) continue;
-
-        if (task.state == RUNNING || task.state == PAUSED) {
-            for (uint8_t z : task.zones) {
+    for (auto& task_item : _tasks) {
+        if (task_item.id == excludeTaskId) continue;
+        if (task_item.state == RUNNING || task_item.state == PAUSED) {
+            for (uint8_t z : task_item.zones) {
                 if (z == zoneId) {
-                    return &task;
+                    return &task_item;
                 }
             }
         }
     }
     return nullptr;
 }
-
-// Remove private declaration of checkTasks if it's fully replaced by update()
-// void TaskScheduler::checkTasks() { /* ... */ } // Remove this if not used 
