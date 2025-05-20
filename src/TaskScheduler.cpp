@@ -412,14 +412,50 @@ void TaskScheduler::update() {
                 }
 
                 // Enhanced Log for debugging completion check
-                // AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedChk", "Task %d: RUNNING. Resuming: %s. Elapsed: %llds. Target: %llds. RemMS: %lu. Start: %lu. Now: %lu",
-                //                task.id,
-                //                task.is_resuming_from_pause ? "Y" : "N",
-                //                (long long)elapsed_seconds,
-                //                (long long)current_target_duration_seconds,
-                //                task.remaining_duration_on_pause_ms,
-                //                (unsigned long)task.start_time,
-                //                (unsigned long)now);
+                
+                if (task.is_resuming_from_pause) { // Only log for task đang resume để giảm nhiễu
+                    char relay_state_str[128] = "Zones: "; // Increased buffer size
+                    if (!task.zones.empty()) {
+                        bool first_zone = true;
+                        for(uint8_t zone_id : task.zones) {
+                            if (zone_id >= 1 && zone_id <= _relayManager.getNumRelays()) { // Assumes getNumRelays exists
+                                if (!first_zone) strcat(relay_state_str, ", ");
+                                strcat(relay_state_str, "Z");
+                                char zone_num_str[4];
+                                sprintf(zone_num_str, "%d", zone_id);
+                                strcat(relay_state_str, zone_num_str);
+                                strcat(relay_state_str, ":");
+                                // strcat(relay_state_str, _relayManager.isOn(zone_id - 1) ? "ON" : "OFF"); // Problematic line
+                                first_zone = false;
+                            }
+                        }
+                    } else {
+                        strcat(relay_state_str, "None");
+                    }
+
+                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedChk", "Task %d: RUNNING. Resuming: Y. Elapsed: %llds. Target: %llds. RemMS: %lu. Start: %lu. Now: %lu. %s",
+                                   task.id,
+                                   (long long)(now - task.start_time), // Calculate elapsed here for current state
+                                   (long long)(task.remaining_duration_on_pause_ms / 1000),
+                                   task.remaining_duration_on_pause_ms,
+                                   (unsigned long)task.start_time,
+                                   (unsigned long)now,
+                                   relay_state_str
+                                   );
+                }
+                
+                if (task.id == 1) { // Or some other way to identify the specific task if IDs can change
+                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg",
+                                   "Task %d CompletionCheck: now=%lu, start_time=%lu, elapsed=%llds, is_resuming=%s, rem_ms=%lu, target_s=%llds",
+                                   task.id,
+                                   (unsigned long)now,
+                                   (unsigned long)task.start_time,
+                                   (long long)(now >= task.start_time ? now - task.start_time : -1), // Calculate elapsed here
+                                   task.is_resuming_from_pause ? "TRUE" : "FALSE",
+                                   task.remaining_duration_on_pause_ms,
+                                   (long long)(task.is_resuming_from_pause ? (task.remaining_duration_on_pause_ms / 1000) : (task.duration * 60))
+                                  );
+                }
 
                 if (elapsed_seconds >= current_target_duration_seconds) {
                     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (resuming: %s) COMPLETED. Elapsed: %llds, Target: %llds. Start: %lu, Now: %lu, RemMS: %lu",
@@ -669,6 +705,8 @@ void TaskScheduler::pauseTask(IrrigationTask& task) {
     }
 
     time_t now = time(NULL);
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedDbg", "PauseTask ID %d: now=%lu, task.start_time=%lu, task.is_resuming_from_pause_before_calc=%s",
+                   task.id, (unsigned long)now, (unsigned long)task.start_time, task.is_resuming_from_pause ? "Y":"N");
     time_t elapsed_seconds_before_pause = now - task.start_time;
     
     uint32_t original_duration_seconds_this_run;
@@ -681,8 +719,8 @@ void TaskScheduler::pauseTask(IrrigationTask& task) {
     int32_t remaining_sec = original_duration_seconds_this_run - elapsed_seconds_before_pause;
     task.remaining_duration_on_pause_ms = (remaining_sec > 0) ? (unsigned long)remaining_sec * 1000 : 0;
 
-    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Pausing task %d. Original duration for this run: %u s. Elapsed: %lld s. Remaining: %lu ms.",
-                   task.id, original_duration_seconds_this_run, elapsed_seconds_before_pause, task.remaining_duration_on_pause_ms);
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Pausing task %d. Original duration for this run: %u s. Elapsed (calc): %ld s. Stored Remaining MS: %lu ms.",
+                   task.id, original_duration_seconds_this_run, (long)elapsed_seconds_before_pause, task.remaining_duration_on_pause_ms);
 
     for (uint8_t zoneId : task.zones) {
         if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
@@ -767,10 +805,8 @@ bool TaskScheduler::isHigherPriority(int checkingTaskId, uint8_t conflictingZone
 time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isRescheduleAfterSkip) {
     time_t now;
     time(&now);
-    // ... (existing logging for task details) ...
     AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d (State: %d, Active: %s), Days: 0x%02X, Time: %02d:%02d, Skip: %s, Current Epoch: %lu", 
                     task.id, task.state, task.active ? "T" : "F", task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)now);
-
 
     if (!task.active) { // If task is inactive, it has no next run time.
         AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d is inactive. Setting next_run to 0.", task.id);
@@ -795,35 +831,20 @@ time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isReschedu
         mktime(&nextDayCandidate_tm); 
         
         if (task.days & (1 << nextDayCandidate_tm.tm_wday)) {
-            // If it's today (dayOffset == 0)
             if (dayOffset == 0) {
-                // And we are NOT rescheduling a skipped task (i.e., we are calculating for a normal IDLE or COMPLETED task)
-                // AND the scheduled time for today has already passed or is current minute (>=)
                 if (!isRescheduleAfterSkip && 
                     (timeinfo_now.tm_hour > task.hour || (timeinfo_now.tm_hour == task.hour && timeinfo_now.tm_min >= task.minute))) {
-                    // If task state is IDLE and its time has passed today, it means it was missed. Look for next day.
-                    // If task state is COMPLETED, it means it just finished, so definitely look for next day or later.
-                    // If task.state == RUNNING/PAUSED/WAITING, this 'if' branch implies it's calculating for a future run after it finishes the current cycle/wait.
                     AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Today's (%s) time %02d:%02d has passed or is current. Skipping to next valid day.", task.id, dayNames[nextDayCandidate_tm.tm_wday], task.hour, task.minute);
                     continue; 
                 }
             }
-            // If isRescheduleAfterSkip is true, it means the task's current slot was missed/skipped.
-            // If dayOffset is 0 (today) and isRescheduleAfterSkip is true, this means we are trying to find the *next* slot,
-            // which could be later today if the task's original time was, say, 10:00, it was skipped, and now it's 10:05.
-            // The mktime normalization and then conversion back should give the correct next instance.
-            // The key is that `isRescheduleAfterSkip` usually implies we *don't* want the immediate past/current slot.
 
             scheduled_tm.tm_year = nextDayCandidate_tm.tm_year;
             scheduled_tm.tm_mon  = nextDayCandidate_tm.tm_mon;
             scheduled_tm.tm_mday = nextDayCandidate_tm.tm_mday;
-            // hour, minute, second are already set
 
             time_t calculated_time = mktime(&scheduled_tm);
 
-            // If rescheduling a skipped task, and the calculated time is still in the past or *now*, it means
-            // the next slot on this *same day* has also passed. This can happen if a task is skipped multiple times
-            // in quick succession. We need to ensure the returned time is strictly in the future.
             if (isRescheduleAfterSkip && calculated_time <= now) {
                  AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Rescheduled time %lu for day %s is still past/present (%lu). Continuing to find future slot.", task.id, (unsigned long)calculated_time, dayNames[nextDayCandidate_tm.tm_wday], (unsigned long)now);
                 continue;
