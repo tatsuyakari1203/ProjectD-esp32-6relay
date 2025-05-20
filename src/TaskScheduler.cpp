@@ -16,7 +16,7 @@ void TaskScheduler::begin() {
         _tasks.clear();
         _activeZonesBits.reset(); 
         _earliestNextCheckTime = 0; 
-        _scheduleStatusChanged = true; 
+        _scheduleStatusChanged = true;
         AppLogger.info("TaskSched", "TaskScheduler initialized");
         xSemaphoreGive(_mutex);
     }
@@ -396,16 +396,40 @@ void TaskScheduler::update() {
         // Section 1: Process RUNNING tasks for completion
         for (auto& task : _tasks) {
             if (task.state == RUNNING) {
-                uint32_t current_run_duration_seconds;
+                time_t current_target_duration_seconds; // Use time_t for consistency
                 if (task.is_resuming_from_pause) {
-                    current_run_duration_seconds = task.remaining_duration_on_pause_ms / 1000;
+                    current_target_duration_seconds = task.remaining_duration_on_pause_ms / 1000;
                 } else {
-                    current_run_duration_seconds = task.duration * 60;
+                    current_target_duration_seconds = task.duration * 60;
                 }
-                time_t elapsed_seconds = now - task.start_time;
 
-                if (elapsed_seconds >= current_run_duration_seconds) {
-                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed its current run (was_resuming: %s).", task.id, task.is_resuming_from_pause ? "yes" : "no");
+                time_t elapsed_seconds = 0;
+                if (now >= task.start_time) { // Should normally always be true for a running task
+                    elapsed_seconds = now - task.start_time;
+                } else {
+                    // This case should ideally not happen if start_time is set correctly.
+                    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSchedChk", "Task %d: now (%lu) < task.start_time (%lu)!", task.id, (unsigned long)now, (unsigned long)task.start_time);
+                }
+
+                // Enhanced Log for debugging completion check
+                // AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSchedChk", "Task %d: RUNNING. Resuming: %s. Elapsed: %llds. Target: %llds. RemMS: %lu. Start: %lu. Now: %lu",
+                //                task.id,
+                //                task.is_resuming_from_pause ? "Y" : "N",
+                //                (long long)elapsed_seconds,
+                //                (long long)current_target_duration_seconds,
+                //                task.remaining_duration_on_pause_ms,
+                //                (unsigned long)task.start_time,
+                //                (unsigned long)now);
+
+                if (elapsed_seconds >= current_target_duration_seconds) {
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (resuming: %s) COMPLETED. Elapsed: %llds, Target: %llds. Start: %lu, Now: %lu, RemMS: %lu",
+                                   task.id, 
+                                   task.is_resuming_from_pause ? "Y":"N", 
+                                   (long long)elapsed_seconds, 
+                                   (long long)current_target_duration_seconds,
+                                   (unsigned long)task.start_time,
+                                   (unsigned long)now,
+                                   task.remaining_duration_on_pause_ms);
                     stopTask(task); // Clears bits, resets resume flags
                     task.state = COMPLETED;
                     task.next_run = calculateNextRunTime(task);
@@ -502,22 +526,32 @@ void TaskScheduler::update() {
                     if (taskToActuallyPause->state == RUNNING) { // Only pause if it's actually running
                        pauseTask(*taskToActuallyPause);
                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d PAUSED by higher priority task %d.", taskToActuallyPause->id, task_to_evaluate.id);
-                       anyStateChangedThisUpdate = true;
+                        anyStateChangedThisUpdate = true;
                     }
                 }
 
+                TaskState state_before_action = task_to_evaluate.state; // Capture state before action
                 if (task_to_evaluate.state == PAUSED) {
-                    // Check if its zones are truly free now (i.e. not taken by another higher prio task that just started)
-                    // This check is implicitly done by the canRunThisTask logic above. If we reached here, it means PAUSED task can resume.
                     resumeTask(task_to_evaluate); 
                     AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d RESUMED.", task_to_evaluate.id);
                 } else { // IDLE or WAITING
-                    TaskState oldState = task_to_evaluate.state;
                     startTask(task_to_evaluate); 
-                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d STARTED (from %s).", task_to_evaluate.id, (oldState == IDLE ? "IDLE" : "WAITING"));
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d STARTED (from %s).", task_to_evaluate.id, (state_before_action == IDLE ? "IDLE" : "WAITING"));
                 }
-                task_to_evaluate.state = RUNNING; // Set by startTask or resumeTask, but ensure it's set here.
-                anyStateChangedThisUpdate = true;
+                
+                // If the state is now RUNNING (it should be after start/resume) and it changed, or was PAUSED/IDLE/WAITING
+                // then we consider the status changed for reporting purposes.
+                if (task_to_evaluate.state == RUNNING) {
+                    if(state_before_action != RUNNING) { // If it wasn't already running (e.g. IDLE, PAUSED, WAITING)
+                        anyStateChangedThisUpdate = true;
+                    }
+                    // If it was already RUNNING and somehow canRunThisTask was true (e.g. error in logic),
+                    // explicitly setting anyStateChangedThisUpdate might not be needed unless an action (like pausing others) occurred.
+                    // The pausing of other tasks already sets anyStateChangedThisUpdate.
+                } else if (task_to_evaluate.state != state_before_action) {
+                    // If state changed to something other than RUNNING (e.g. resumeTask decided to mark COMPLETED directly)
+                    anyStateChangedThisUpdate = true;
+                }
             }
         } // End main task evaluation loop
 
