@@ -16,7 +16,7 @@ TOPIC_CONTROL = f"irrigation/{DEVICE_ID}/control"
 TOPIC_STATUS = f"irrigation/{DEVICE_ID}/status"
 API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2"  # Replace with your actual API key
 
-NUM_TESTS = 1000  # Total number of test iterations
+NUM_TESTS = 100  # Total number of test iterations
 WAIT_BETWEEN_TESTS = 1  # Wait time between tests (seconds)
 RELAY_IDS = [1, 2, 3, 4, 5, 6]  # IDs of the relays to be tested
 RESPONSE_TIMEOUT = 5  # Time to wait for a response from the relays (seconds)

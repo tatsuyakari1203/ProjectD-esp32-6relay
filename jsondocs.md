@@ -34,7 +34,7 @@ Hệ thống sử dụng các MQTT topic sau để giao tiếp:
 | `irrigation/esp32_6relay/schedule` | Subscribe | ESP32 nhận lệnh lập lịch tưới |
 | `irrigation/esp32_6relay/schedule/status` | Publish | ESP32 báo cáo trạng thái lịch tưới |
 | `irrigation/esp32_6relay/environment` | Subscribe | ESP32 nhận cập nhật điều kiện môi trường |
-| `irrigation/esp32_6relay/log` | Publish | ESP32 gửi các tin nhắn log qua MQTT để giám sát từ xa |
+| `irrigation/esp32_6relay/logs` | Publish | ESP32 gửi các tin nhắn log qua MQTT để giám sát từ xa |
 | `irrigation/esp32_6relay/logconfig` | Subscribe | ESP32 nhận lệnh để thay đổi mức log cho Serial hoặc MQTT tại thời gian chạy |
 
 ## Cấu trúc JSON
@@ -682,7 +682,7 @@ Sau đó gửi tiếp:
 }
 ```
 
-### 7. Tin nhắn Log (`irrigation/esp32_6relay/log`)
+### 7. Tin nhắn Log (`irrigation/esp32_6relay/logs`)
 
 ESP32 gửi các tin nhắn log qua MQTT để giám sát từ xa. Các tin nhắn này có thể là log hệ thống chuẩn hoặc log hiệu suất.
 

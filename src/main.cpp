@@ -39,9 +39,11 @@ TaskHandle_t core0Task;  // Handles sensors, MQTT, scheduling (preemptive)
 TaskHandle_t core1Task;  // Handles irrigation control events (event-driven)
 
 // Priority levels (higher number = higher priority)
-#define PRIORITY_LOW 1
-#define PRIORITY_MEDIUM 2
-#define PRIORITY_HIGH 3
+// Values chosen based on typical ESP-IDF system task priorities (e.g., lwIP:18, Wi-Fi:23)
+// Refer to ESP-IDF documentation for task priority guidelines.
+#define APP_TASK_PRIORITY_LOW    (tskIDLE_PRIORITY + 5)  // Example: 5
+#define APP_TASK_PRIORITY_MEDIUM (tskIDLE_PRIORITY + 10) // Example: 10 (For Core0Task & Core1Task)
+#define APP_TASK_PRIORITY_HIGH   (tskIDLE_PRIORITY + 15) // Example: 15
 
 // Stack sizes
 #define STACK_SIZE_CORE0 8192
@@ -61,7 +63,7 @@ const int relayPins[] = {
 const int numRelays = 6;
 
 // WiFi and MQTT configuration
-const char* WIFI_SSID = "2.4 KariS";  // TODO: Replace with your WiFi name
+const char* WIFI_SSID = "karis";  // TODO: Replace with your WiFi name
 const char* WIFI_PASSWORD = "12123402";  // TODO: Replace with your WiFi password
 const char* MQTT_SERVER = "karis.cloud";
 const int MQTT_PORT = 1883;
@@ -215,10 +217,23 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // This task is preemptive.
 void Core0TaskCode(void * parameter) {
   AppLogger.logf(LOG_LEVEL_INFO, "Core0", "Task started on core %d", xPortGetCoreID());
-  
+  static bool mqttPreviouslyConnected = false; // Track previous MQTT connection state
+
   for(;;) {
     // Maintain network connection
     networkManager.loop();
+
+    // Check for MQTT reconnection and re-subscribe if necessary
+    bool mqttCurrentlyConnected = networkManager.isConnected();
+    if (mqttCurrentlyConnected && !mqttPreviouslyConnected) {
+      AppLogger.info("Core0", "MQTT (re)connected. Re-subscribing to topics...");
+      networkManager.subscribe(MQTT_TOPIC_CONTROL);
+      networkManager.subscribe(MQTT_TOPIC_SCHEDULE);
+      networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL);
+      networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG);
+      // Add any other topics that need re-subscription here
+    }
+    mqttPreviouslyConnected = mqttCurrentlyConnected;
     
     unsigned long currentTime = millis();
     
@@ -446,20 +461,16 @@ void setup() {
   
   // NetworkManager handles subscriptions internally upon successful MQTT connection.
   // No need to call subscribe directly here after initial setup.
-  networkManager.subscribe(MQTT_TOPIC_CONTROL);
-  networkManager.subscribe(MQTT_TOPIC_SCHEDULE);
-  networkManager.subscribe(MQTT_TOPIC_ENV_CONTROL);
-  networkManager.subscribe(MQTT_TOPIC_LOG_CONFIG);
+  // The logic in Core0TaskCode will handle subscriptions when MQTT is connected.
 
   // LED and Buzzer status indicators are managed in Core0TaskCode based on networkManager.isConnected().
-  // Direct signal commands here are removed to avoid conflicts.
 
   // Create tasks and pin them to specific cores
   AppLogger.info("Setup", "Creating and pinning tasks to cores...");
   xTaskCreatePinnedToCore(
-    Core0TaskCode, "Core0Task", STACK_SIZE_CORE0, NULL, PRIORITY_MEDIUM, &core0Task, 0);
+    Core0TaskCode, "Core0Task", STACK_SIZE_CORE0, NULL, APP_TASK_PRIORITY_MEDIUM, &core0Task, 0);
   xTaskCreatePinnedToCore(
-    Core1TaskCode, "Core1Task", STACK_SIZE_CORE1, NULL, PRIORITY_MEDIUM, &core1Task, 1);
+    Core1TaskCode, "Core1Task", STACK_SIZE_CORE1, NULL, APP_TASK_PRIORITY_MEDIUM, &core1Task, 1);
     
   AppLogger.info("Setup", "System setup sequence completed. Tasks are running.");
   AppLogger.info("Setup", "---------------- SYSTEM READY ----------------");
