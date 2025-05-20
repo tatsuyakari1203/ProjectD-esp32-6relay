@@ -62,8 +62,17 @@ const int relayPins[] = {
 const int numRelays = sizeof(relayPins) / sizeof(relayPins[0]);
 
 // WiFi and MQTT configuration
-const char* WIFI_SSID = "karis";
-const char* WIFI_PASSWORD = "12123402";
+// const char* WIFI_SSID = "karis"; // Old single SSID
+// const char* WIFI_PASSWORD = "12123402"; // Old single password
+// const char* WIFI_SSID_2 = "2.4 KariS"; // Old second SSID
+// const char* WIFI_PASSWORD_2 = "12123402"; // Old second password
+
+std::vector<WiFiCredential> wifiCredentials = {
+    {"karis", "12123402"},
+    {"2.4 KariS", "12123402"},
+    {"KariSP", "12123402"} // Added third WiFi network
+};
+
 const char* MQTT_SERVER = "karis.cloud";
 const int MQTT_PORT = 1883;
 const char* API_KEY = "8a679613-019f-4b88-9068-da10f09dcdd2";
@@ -325,7 +334,8 @@ void setup() {
   AppLogger.begin(nullptr, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO);
   AppLogger.info("Setup", "Logger initialized.");
 
-  if (!networkManager.begin(WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_PORT)) {
+  // Pass the vector of credentials to NetworkManager
+  if (!networkManager.begin(wifiCredentials, MQTT_SERVER, MQTT_PORT)) {
     AppLogger.error("Setup", "NetworkManager failed to initialize properly. System will attempt to reconnect.");
   } else {
     AppLogger.info("Setup", "NetworkManager initialized. Attempting to connect...");

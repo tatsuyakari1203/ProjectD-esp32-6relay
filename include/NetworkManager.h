@@ -11,6 +11,12 @@
 // Type definition for the MQTT message callback function
 typedef void (*MqttCallback)(char* topic, byte* payload, unsigned int length);
 
+// New struct for WiFi credentials
+struct WiFiCredential {
+    const char* ssid;
+    const char* password;
+};
+
 // Configuration for WiFi and MQTT connection retry mechanisms
 const uint8_t MAX_WIFI_RETRY_ATTEMPTS = 10;       // Maximum attempts to reconnect to WiFi before a longer pause
 const uint8_t MAX_MQTT_RETRY_ATTEMPTS = 10;       // Maximum attempts to reconnect to MQTT before a longer pause
@@ -22,7 +28,7 @@ class NetworkManager {
 public:
     NetworkManager();
     // Initializes WiFi, NTP, and MQTT. Attempts initial connections.
-    bool begin(const char* ssid, const char* password, const char* mqttServer, int mqttPort);
+    bool begin(const std::vector<WiFiCredential>& credentials, const char* mqttServer, int mqttPort);
     
     // Publishes a message to the specified MQTT topic.
     bool publish(const char* topic, const char* payload);
@@ -51,8 +57,7 @@ private:
     WiFiUDP _ntpUDP;               // UDP client for NTP
     NTPClient _timeClient;         // NTP client for time synchronization
     
-    char _ssid[64];                // WiFi SSID
-    char _password[64];            // WiFi password
+    std::vector<WiFiCredential> _wifiCredentials; // Stores all WiFi credentials
     char _mqttServer[64];          // MQTT broker address
     int _mqttPort;                 // MQTT broker port
     char _clientId[32];            // Unique client ID for MQTT
@@ -77,6 +82,7 @@ private:
 
     // Internal helper methods for connection management
     bool _connectWifi();
+    bool _tryConnectWifi(const char* ssid, const char* password);
     bool _connectMqtt();
     void _executeMqttSubscriptions(); // Subscribes to all topics in _subscriptionTopics
     void _handleWifiDisconnect();     // Handles WiFi disconnection events and initiates reconnection sequence

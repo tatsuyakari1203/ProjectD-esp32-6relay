@@ -32,9 +32,8 @@ NetworkManager::NetworkManager() : _timeClient(_ntpUDP) { // Server set dynamica
     Serial.println("Generated MQTT Client ID: " + String(_clientId));
 }
 
-bool NetworkManager::begin(const char* ssid, const char* password, const char* mqttServer, int mqttPort) {
-    strncpy(_ssid, ssid, sizeof(_ssid) -1); _ssid[sizeof(_ssid)-1] = '\0';
-    strncpy(_password, password, sizeof(_password) -1); _password[sizeof(_password)-1] = '\0';
+bool NetworkManager::begin(const std::vector<WiFiCredential>& credentials, const char* mqttServer, int mqttPort) {
+    _wifiCredentials = credentials;
     strncpy(_mqttServer, mqttServer, sizeof(_mqttServer) -1); _mqttServer[sizeof(_mqttServer)-1] = '\0';
     _mqttPort = mqttPort;
 
@@ -69,31 +68,45 @@ bool NetworkManager::begin(const char* ssid, const char* password, const char* m
     return false;
 }
 
-bool NetworkManager::_connectWifi() {
-    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Connecting to WiFi SSID: %s", _ssid);
-    _isAttemptingWifiReconnect = true;
-    WiFi.begin(_ssid, _password);
+bool NetworkManager::_tryConnectWifi(const char* ssid, const char* password) {
+    AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Connecting to WiFi SSID: %s", ssid);
+    WiFi.begin(ssid, password);
     
     unsigned long startTime = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - startTime > WIFI_CONNECT_TIMEOUT_MS) {
             AppLogger.error("NetMgr", "WiFi connection timed out.");
             WiFi.disconnect(true); // Ensure proper disconnection
-            _isAttemptingWifiReconnect = false;
-            _wifiConnected = false;
             return false;
         }
         delay(500);
         Serial.print(".");
     }
-    
     Serial.println();
     AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "WiFi connected. IP: %s", WiFi.localIP().toString().c_str());
-    _wifiConnected = true;
-    _isAttemptingWifiReconnect = false;
-    _wifiRetryCount = 0; // Reset retry counters on successful connection
-    _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS; 
     return true;
+}
+
+bool NetworkManager::_connectWifi() {
+    AppLogger.info("NetMgr", "Attempting to connect to WiFi...");
+    _isAttemptingWifiReconnect = true;
+
+    for (const auto& cred : _wifiCredentials) {
+        AppLogger.logf(LOG_LEVEL_INFO, "NetMgr", "Trying WiFi: %s", cred.ssid);
+        if (_tryConnectWifi(cred.ssid, cred.password)) {
+            _wifiConnected = true;
+            _isAttemptingWifiReconnect = false;
+            _wifiRetryCount = 0;
+            _currentWifiRetryIntervalMs = INITIAL_RETRY_INTERVAL_MS;
+            return true;
+        }
+        AppLogger.logf(LOG_LEVEL_WARNING, "NetMgr", "Failed to connect to WiFi: %s", cred.ssid);
+    }
+
+    AppLogger.error("NetMgr", "All configured WiFi connections failed.");
+    _wifiConnected = false;
+    _isAttemptingWifiReconnect = false; 
+    return false;
 }
 
 bool NetworkManager::_connectMqtt() {
