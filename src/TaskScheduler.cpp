@@ -1,6 +1,9 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Logger.h"
 
+// File-scope constant for day names, used in logging
+static const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
 TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& envManager) 
     : _relayManager(relayManager), _envManager(envManager) {
     _mutex = xSemaphoreCreateMutex();
@@ -10,69 +13,68 @@ TaskScheduler::TaskScheduler(RelayManager& relayManager, EnvironmentManager& env
 
 void TaskScheduler::begin() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        // Initialize with an empty task list.
         _tasks.clear();
-        _activeZonesBits.reset(); // Clear all bits, indicating all zones are initially inactive.
-        _earliestNextCheckTime = 0; // Recalculate on first update or task addition.
-        _scheduleStatusChanged = true; // Mark as changed to send initial status.
-        
+        _activeZonesBits.reset(); 
+        _earliestNextCheckTime = 0; 
+        _scheduleStatusChanged = true; 
         AppLogger.info("TaskSched", "TaskScheduler initialized");
-        
         xSemaphoreGive(_mutex);
     }
 }
 
-bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task) {
+bool TaskScheduler::addOrUpdateTask(const IrrigationTask& task_param) {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        // Find if a task with the same ID already exists.
+        IrrigationTask task = task_param; // Work with a copy to set new defaults if needed
+
         auto it = std::find_if(_tasks.begin(), _tasks.end(),
-                              [task](const IrrigationTask& t) { return t.id == task.id; });
+                              [&task](const IrrigationTask& t) { return t.id == task.id; });
         
         if (it != _tasks.end()) {
-            // Update existing task.
             AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Updating task ID: %d. Previous state: %d, New active: %s", task.id, it->state, task.active ? "true" : "false");
-            // If the task was running and is now being set to inactive, stop its relays.
+            
+            // Preserve runtime state if task is being updated but not fundamentally changed in a way that requires reset
+            task.state = it->state;
+            task.start_time = it->start_time;
+            task.remaining_duration_on_pause_ms = it->remaining_duration_on_pause_ms;
+            task.is_resuming_from_pause = it->is_resuming_from_pause;
+
             if (it->state == RUNNING && !task.active) {
                 AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task ID: %d was RUNNING and is being deactivated. Stopping relays.", task.id);
                 stopTask(*it); // Stop based on the *old* task's zone configuration
-                it->state = IDLE; // Explicitly set to IDLE as it's being deactivated
-                _scheduleStatusChanged = true; // State changed
+                it->state = IDLE; // Set to IDLE as it's deactivated
             }
-            *it = task; // Apply the update from the new task definition
-            // If the task remains active, or becomes active, recalculate its next run time.
-            // If it became inactive (handled above), next_run is less critical but calculateNextRunTime handles it.
+            
+            *it = task; // Apply the update
+            
             if (it->active) {
                  it->next_run = calculateNextRunTime(*it);
             } else {
-                // If task is made inactive, its next_run should be cleared or set to 0
                 it->next_run = 0;
-                // Ensure state is IDLE if it was not already set (e.g. if it wasn't running before)
-                if (it->state != IDLE) { // It might have been COMPLETED before update
-                    it->state = IDLE;
-                    _scheduleStatusChanged = true; // State changed
+                if (it->state != IDLE && it->state != COMPLETED) { // If it was RUNNING (handled above), PAUSED, or WAITING
+                    if (it->state == RUNNING || it->state == PAUSED) { // If it was running or paused, ensure relays are off
+                        stopTask(*it); // This also clears zone bits
+                    }
+                    it->state = IDLE; 
                 }
             }
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Updated irrigation task ID: %d. New next_run: %lu, New state: %d", task.id, (unsigned long)it->next_run, it->state);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Updated irrigation task ID: %d. New next_run: %lu, Active: %s, State: %d", it->id, (unsigned long)it->next_run, it->active ? "true" : "false", it->state);
         } else {
-            // Add new task.
-            IrrigationTask newTask = task;
-            newTask.state = IDLE; // New tasks start as IDLE.
-            newTask.start_time = 0;
-            // Calculate its first run time.
-            newTask.next_run = calculateNextRunTime(newTask);
+            // Add new task - task_param already has defaults from constructor or JSON parsing
+            _tasks.push_back(task);
+            IrrigationTask& newTaskRef = _tasks.back(); // Get a reference to the task in the vector
+            newTaskRef.state = IDLE; // New tasks start as IDLE.
+            newTaskRef.start_time = 0;
+            newTaskRef.next_run = calculateNextRunTime(newTaskRef);
             
-            _tasks.push_back(newTask);
-            
-            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Added new irrigation task ID: %d", task.id);
+            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Added new irrigation task ID: %d, preemptable: %s", task.id, task.preemptable ? "true" : "false");
         }
         
-        _scheduleStatusChanged = true; // Flag that schedule has changed.
-        recomputeEarliestNextCheckTime(); // Update the overall next check time for the scheduler.
+        _scheduleStatusChanged = true;
+        recomputeEarliestNextCheckTime();
         
         xSemaphoreGive(_mutex);
         return true;
     }
-    
     return false;
 }
 
@@ -82,104 +84,79 @@ bool TaskScheduler::deleteTask(int taskId) {
                               [taskId](const IrrigationTask& t) { return t.id == taskId; });
         
         if (it != _tasks.end()) {
-            // If the task to be deleted is currently running, stop it first.
-            if (it->state == RUNNING) {
+            if (it->state == RUNNING || it->state == PAUSED) { // If running or paused, stop it and free resources
                 stopTask(*it);
             }
-            
-            _tasks.erase(it); // Remove the task from the list.
-            _scheduleStatusChanged = true; // Flag that schedule has changed.
-            recomputeEarliestNextCheckTime(); // Update the overall next check time.
-            
+            _tasks.erase(it);
+            _scheduleStatusChanged = true;
+            recomputeEarliestNextCheckTime();
             AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Deleted irrigation task ID: %d", taskId);
             xSemaphoreGive(_mutex);
             return true;
         }
-        
         xSemaphoreGive(_mutex);
     }
-    
     AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task ID not found for deletion: %d", taskId);
     return false;
 }
 
 String TaskScheduler::getTasksJson(const char* apiKey) {
-    StaticJsonDocument<2048> doc; // Adjust size as needed for all tasks.
-    
+    StaticJsonDocument<2048> doc;
     doc["api_key"] = apiKey;
-    doc["timestamp"] = (uint32_t)time(NULL); // Current Unix timestamp.
-    
+    doc["timestamp"] = (uint32_t)time(NULL);
     JsonArray tasks = doc.createNestedArray("tasks");
     
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
-        // Add each task's details to the JSON array.
         for (const auto& task : _tasks) {
             JsonObject taskObj = tasks.createNestedObject();
-            
             taskObj["id"] = task.id;
             taskObj["active"] = task.active;
             
-            // Convert day bitmap to a JSON array of day numbers (1-7).
             JsonArray days = bitmapToDaysArray(doc, task.days);
             taskObj["days"] = days;
             
-            // Format time as HH:MM string.
             char timeStr[6];
             sprintf(timeStr, "%02d:%02d", task.hour, task.minute);
             taskObj["time"] = timeStr;
+            taskObj["duration"] = task.duration;
             
-            taskObj["duration"] = task.duration; // Duration in minutes.
-            
-            // Add irrigation zones for this task.
             JsonArray zones = taskObj.createNestedArray("zones");
             for (uint8_t zone : task.zones) {
                 zones.add(zone);
             }
-            
             taskObj["priority"] = task.priority;
+            taskObj["preemptable"] = task.preemptable; // Serialize new field
             
-            // Add task state string.
             switch (task.state) {
-                case IDLE:
-                    taskObj["state"] = "idle";
-                    break;
-                case RUNNING:
-                    taskObj["state"] = "running";
-                    break;
-                case COMPLETED:
-                    taskObj["state"] = "completed"; // Task ran to completion, awaiting next scheduled run.
-                    break;
+                case IDLE: taskObj["state"] = "idle"; break;
+                case RUNNING: taskObj["state"] = "running"; break;
+                case COMPLETED: taskObj["state"] = "completed"; break;
+                case PAUSED: taskObj["state"] = "paused"; break;
+                case WAITING: taskObj["state"] = "waiting"; break;
+            }
+
+            if (task.state == PAUSED) {
+                taskObj["remaining_duration_ms"] = task.remaining_duration_on_pause_ms;
             }
             
-            // Add next run time if calculated.
             if (task.next_run > 0) {
                 char next_run_str[25];
                 struct tm next_timeinfo;
-                if (localtime_r(&task.next_run, &next_timeinfo)) {
-                    strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
-                    taskObj["next_run"] = next_run_str;
-                } else {
-                    AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "Task %d: localtime_r failed for next_run timestamp %ld", task.id, (long)task.next_run);
-                    taskObj["next_run"] = nullptr; // Serialize as null if localtime_r fails
-                }
+                localtime_r(&task.next_run, &next_timeinfo); // Use localtime_r
+                strftime(next_run_str, sizeof(next_run_str), "%Y-%m-%d %H:%M:%S", &next_timeinfo);
+                taskObj["next_run"] = next_run_str;
             } else {
-                // If task.next_run is 0 (or less), set to null in JSON.
                 taskObj["next_run"] = nullptr;
             }
             
-            // Add sensor condition details if enabled for the task.
             if (task.sensor_condition.enabled) {
                 addSensorConditionToJson(doc, taskObj, task.sensor_condition);
             }
         }
-        
         xSemaphoreGive(_mutex);
     }
-    
-    // Serialize the JSON document to a string.
     String jsonString;
     serializeJson(doc, jsonString);
-    
     return jsonString;
 }
 
@@ -242,7 +219,7 @@ void TaskScheduler::addSensorConditionToJson(JsonDocument& doc, JsonObject& task
 }
 
 bool TaskScheduler::processCommand(const char* json) {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(2048); // Increased size slightly for new fields
     DeserializationError error = deserializeJson(doc, json);
     
     if (error) {
@@ -250,97 +227,70 @@ bool TaskScheduler::processCommand(const char* json) {
         return false;
     }
     
-    // TODO: Implement API key validation if required for commands.
-    
-    // Check if it's a command to delete tasks.
     if (doc.containsKey("delete_tasks")) {
         return processDeleteCommand(json);
     }
     
-    // Check for the main "tasks" array for add/update operations.
     if (!doc.containsKey("tasks")) {
         AppLogger.error("TaskSched", "Missing 'tasks' field in command");
         return false;
     }
     
     JsonArray tasksArray = doc["tasks"];
-    bool anyChanges = false; // Tracks if any task was successfully added or updated.
+    bool anyChanges = false;
     
-    // Process each task object in the JSON array.
     for (JsonObject taskJson : tasksArray) {
-        // Validate required fields for a task.
-        if (!taskJson.containsKey("id") || 
-            !taskJson.containsKey("active") ||
-            !taskJson.containsKey("days") ||
-            !taskJson.containsKey("time") ||
-            !taskJson.containsKey("duration") ||
-            !taskJson.containsKey("zones")) {
-            
+        if (!taskJson.containsKey("id") || !taskJson.containsKey("active") ||
+            !taskJson.containsKey("days") || !taskJson.containsKey("time") ||
+            !taskJson.containsKey("duration") || !taskJson.containsKey("zones")) {
             AppLogger.error("TaskSched", "Missing required fields in task object");
-            continue; // Skip this malformed task object.
+            continue;
         }
         
-        // Create an IrrigationTask object from JSON data.
-        IrrigationTask task;
+        IrrigationTask task; // Uses constructor for defaults
         task.id = taskJson["id"];
         task.active = taskJson["active"];
-        
-        // Convert JSON array of day numbers (1-7) to a days bitmap.
         task.days = daysArrayToBitmap(taskJson["days"]);
         
-        // Parse time string (expected format "HH:MM").
         String timeStr = taskJson["time"].as<String>();
         int separator = timeStr.indexOf(':');
         if (separator > 0) {
             task.hour = timeStr.substring(0, separator).toInt();
             task.minute = timeStr.substring(separator + 1).toInt();
         } else {
-            task.hour = 0;
-            task.minute = 0;
+            task.hour = 0; task.minute = 0;
         }
         
-        task.duration = taskJson["duration"]; // Duration in minutes.
+        task.duration = taskJson["duration"];
         
-        // Process zones array.
         JsonArray zonesArray = taskJson["zones"];
         task.zones.clear();
         for (JsonVariant zone : zonesArray) {
             task.zones.push_back(zone.as<uint8_t>());
         }
         
-        // Priority (defaults to 5 if not provided).
         task.priority = taskJson.containsKey("priority") ? taskJson["priority"] : 5;
+        task.preemptable = taskJson.containsKey("preemptable") ? taskJson["preemptable"].as<bool>() : true; // Default to true
         
-        // Initialize sensor condition defaults.
-        task.sensor_condition.enabled = false;
-        task.sensor_condition.temperature_check = false;
-        task.sensor_condition.humidity_check = false;
-        task.sensor_condition.soil_moisture_check = false;
-        task.sensor_condition.rain_check = false;
-        task.sensor_condition.light_check = false;
-        
-        // Parse sensor conditions if present in JSON.
+        // Sensor conditions
+        task.sensor_condition.enabled = false; // Default
         if (taskJson.containsKey("sensor_condition")) {
             JsonObject sensorCondition = taskJson["sensor_condition"];
             parseSensorCondition(sensorCondition, task.sensor_condition);
         }
         
-        // Default state for new/updated tasks (will be IDLE).
-        task.state = IDLE;
-        task.start_time = 0;
+        // state, start_time, next_run, remaining_duration_on_pause_ms, is_resuming_from_pause
+        // are handled by addOrUpdateTask logic or default constructor.
         
-        // Add or update the task in the scheduler.
-        if (addOrUpdateTask(task)) {
+        if (addOrUpdateTask(task)) { // Pass the fully constructed task
             anyChanges = true;
         }
     }
     
-    // If any tasks were successfully added or updated.
     if (anyChanges) {
-        _scheduleStatusChanged = true; // Flag that schedule has changed.
-        recomputeEarliestNextCheckTime(); // Update overall next check time.
+        _scheduleStatusChanged = true;
+        recomputeEarliestNextCheckTime();
     }
-    
     return anyChanges;
 }
 
@@ -430,144 +380,151 @@ bool TaskScheduler::processDeleteCommand(const char* json) {
 
 void TaskScheduler::update() {
     unsigned long currentMillis = millis();
-    
-    // Rate limit scheduler checks (e.g., once per second).
-    if (currentMillis - _lastCheckTime < 1000) {
+    if (currentMillis - _lastCheckTime < 1000) { // Rate limit
         return;
     }
     _lastCheckTime = currentMillis;
-    
+
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
         time_t now;
         time(&now);
-        
-        // If it's not yet time for the earliest scheduled check, exit early.
-        if (_earliestNextCheckTime != 0 && now < _earliestNextCheckTime) {
-            xSemaphoreGive(_mutex);
-            return;
-        }
-        
         struct tm timeinfo;
-        localtime_r(&now, &timeinfo); // Get current local time details.
-        
-        bool anyStateChangedThisUpdate = false; // Tracks if any task's state changed during this update cycle.
-        
-        // 1. Update status of currently RUNNING tasks.
+        localtime_r(&now, &timeinfo); // Use localtime_r for thread safety
+
+        bool anyStateChangedThisUpdate = false;
+
+        // Section 1: Process RUNNING tasks for completion
         for (auto& task : _tasks) {
             if (task.state == RUNNING) {
-                // Check if the task has completed its duration.
-                if (now - task.start_time >= task.duration * 60) { // task.duration is in minutes.
-                    stopTask(task);
-                    
-                    TaskState oldState = task.state;
+                uint32_t current_run_duration_seconds;
+                if (task.is_resuming_from_pause) {
+                    current_run_duration_seconds = task.remaining_duration_on_pause_ms / 1000;
+                } else {
+                    current_run_duration_seconds = task.duration * 60;
+                }
+                time_t elapsed_seconds = now - task.start_time;
+
+                if (elapsed_seconds >= current_run_duration_seconds) {
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed its current run (was_resuming: %s).", task.id, task.is_resuming_from_pause ? "yes" : "no");
+                    stopTask(task); // Clears bits, resets resume flags
                     task.state = COMPLETED;
-                    if (oldState != task.state) {
-                        anyStateChangedThisUpdate = true;
-                    }
-                    
-                    // Calculate the next run time for this completed task.
                     task.next_run = calculateNextRunTime(task);
-                    
-                    if (task.next_run > 0) {
-                        char timebuf[30];
-                        ctime_r(&task.next_run, timebuf);
-                        timebuf[strlen(timebuf)-1] = 0; // Remove newline
-                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed, next run at: %s", task.id, timebuf);
-                    } else {
-                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d completed, no further runs scheduled (next_run is 0).", task.id);
-                    }
+                    anyStateChangedThisUpdate = true;
                 }
             }
         }
-        
-        // 2. Check for tasks scheduled to start NOW.
-        for (auto& task : _tasks) {
-            if (!task.active || task.state == RUNNING) continue; // Skip inactive or already running tasks.
-            
-            // Check if today is a scheduled day for this task (0=Sun, 1=Mon, ..., 6=Sat).
-            bool isDayMatch = (task.days & (1 << timeinfo.tm_wday));
-            
-            // Check if current time matches task's scheduled hour and minute.
-            bool isTimeMatch = (timeinfo.tm_hour == task.hour && 
-                               timeinfo.tm_min == task.minute);
-            
-            // If day and time match:
-            if (isDayMatch && isTimeMatch) {
-                AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d scheduled time match", task.id);
-                
-                // Check sensor conditions before starting.
-                if (!checkSensorConditions(task)) {
-                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d conditions not met, skipping.", task.id);
-                    // Recalculate next run for this skipped task to avoid re-triggering immediately if conditions persist.
-                    task.next_run = calculateNextRunTime(task, true); // `true` indicates it's being skipped now.
-                    anyStateChangedThisUpdate = true; // Next run time changed.
-                    continue; 
+
+        // Section 2: Try to start IDLE, WAITING tasks or resume PAUSED tasks
+        for (auto& task_to_evaluate : _tasks) {
+            if (!task_to_evaluate.active) continue;
+
+            bool canProceedWithEvaluation = false;
+            if (task_to_evaluate.state == IDLE) {
+                bool isDayMatch = (task_to_evaluate.days & (1 << timeinfo.tm_wday));
+                bool isTimeMatch = (timeinfo.tm_hour == task_to_evaluate.hour && timeinfo.tm_min == task_to_evaluate.minute);
+                if (now >= task_to_evaluate.next_run && task_to_evaluate.next_run != 0) { // Check against next_run time
+                     if (isDayMatch && isTimeMatch) canProceedWithEvaluation = true; // Original time match
+                } else if (isDayMatch && isTimeMatch && (task_to_evaluate.next_run == 0 || now >= task_to_evaluate.next_run ) ) { // Fallback for initial runs or if next_run was 0
+                    canProceedWithEvaluation = true;
                 }
-                
-                bool canStartThisTask = true;
-                
-                // Check for zone conflicts and priority.
-                for (uint8_t zoneId : task.zones) {
-                    if (isZoneBusy(zoneId)) {
-                        // If zone is busy, check if this task has higher priority to preempt.
-                        if (isHigherPriority(task.id, zoneId)) { // Pass zoneId to check specific conflicting task
-                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d has higher priority, stopping conflicting tasks in zone %u", task.id, zoneId);
-                            
-                            // Find and stop lower priority tasks using this zone.
-                            for (auto& runningTask : _tasks) {
-                                if (runningTask.state == RUNNING) {
-                                    // Check if this runningTask uses the conflicting zoneId.
-                                    if (std::find(runningTask.zones.begin(), 
-                                                runningTask.zones.end(), 
-                                                zoneId) != runningTask.zones.end()) {
-                                        stopTask(runningTask);
-                                        
-                                        TaskState oldState = runningTask.state;
-                                        runningTask.state = COMPLETED; // Mark as completed (preempted).
-                                        if (oldState != runningTask.state) {
-                                            anyStateChangedThisUpdate = true;
-                                        }
-                                        
-                                        runningTask.next_run = calculateNextRunTime(runningTask);
-                                        
-                                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Preempted task %d due to higher priority task %d", runningTask.id, task.id);
-                                    }
-                                }
-                            }
+
+            } else if (task_to_evaluate.state == WAITING || task_to_evaluate.state == PAUSED) {
+                canProceedWithEvaluation = true;
+            }
+
+            if (!canProceedWithEvaluation) continue;
+
+            // Sensor conditions check (only for IDLE or WAITING trying to start fresh)
+            if (task_to_evaluate.state == IDLE || task_to_evaluate.state == WAITING) {
+                if (!checkSensorConditions(task_to_evaluate)) {
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d conditions not met, skipping/remaining WAITING.", task_to_evaluate.id);
+                    if (task_to_evaluate.state == IDLE) {
+                        task_to_evaluate.state = WAITING; // Move to waiting if conditions fail at scheduled time
+                        task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true); // Mark as skipped
+                    }
+                    anyStateChangedThisUpdate = true;
+                    continue;
+                }
+            }
+
+            // Zone conflict resolution and starting/resuming
+            bool canRunThisTask = true;
+            std::vector<IrrigationTask*> tasksToPauseForThisEvaluation; 
+
+            for (uint8_t zoneId : task_to_evaluate.zones) {
+                IrrigationTask* conflictingTask = getTaskUsingZone(zoneId, task_to_evaluate.id);
+
+                if (conflictingTask) { // Zone is busy (RUNNING or PAUSED)
+                    if (task_to_evaluate.state == PAUSED && conflictingTask->id == task_to_evaluate.id) {
+                        // This is the PAUSED task itself "occupying" its zone, which is fine for resumption check.
+                        // But if another task is *also* in this zone, that's a different conflict.
+                        // getTaskUsingZone should exclude the task_to_evaluate if it's PAUSED.
+                        // Let's refine getTaskUsingZone or ensure PAUSED task isn't seen as conflicting with itself.
+                        // For now, this means a PAUSED task checks if its zone is *still* held by its *own* paused reservation.
+                        // If another task is using it, that's a conflict.
+                        // If zone is busy by *another* task:
+                        // This case is complex: task_to_evaluate is PAUSED, wants to resume, but zone is taken by *another* task.
+                        // For now, PAUSED task will only resume if its zones are free or taken by itself.
+                        continue; // PAUSED task's own reservation is not a conflict for itself
+                    }
+
+
+                    if (task_to_evaluate.priority > conflictingTask->priority) {
+                        if (conflictingTask->preemptable) {
+                            bool alreadyMarked = false;
+                            for(const auto* tp : tasksToPauseForThisEvaluation) if(tp->id == conflictingTask->id) alreadyMarked = true;
+                            if(!alreadyMarked) tasksToPauseForThisEvaluation.push_back(conflictingTask);
                         } else {
-                            // Not high enough priority to preempt the currently running task in this zone.
-                            canStartThisTask = false;
-                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d cannot start, zone %u busy with higher or equal priority task.", task.id, zoneId);
-                            // Reschedule this task for its next logical slot because it couldn't run now.
-                            task.next_run = calculateNextRunTime(task, true); // `true` means it was skipped.
-                            anyStateChangedThisUpdate = true; // Next run time changed.
-                            break; // Stop checking other zones for this task, as it can't start.
+                            canRunThisTask = false;
+                            if (task_to_evaluate.state != WAITING) { // If IDLE or PAUSED
+                                task_to_evaluate.state = WAITING;
+                                task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true); 
+                            }
+                            AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d) cannot start/resume, zone %u busy with non-preemptable task %d. Setting/keeping WAITING.", task_to_evaluate.id, task_to_evaluate.state, zoneId, conflictingTask->id);
+                            anyStateChangedThisUpdate = true;
+                            break; 
                         }
-                    }
-                }
-                
-                // If all checks pass, start the task.
-                if (canStartThisTask) {
-                    startTask(task);
-                    
-                    TaskState oldState = task.state;
-                    task.state = RUNNING;
-                    if (oldState != task.state) {
+                    } else { 
+                        canRunThisTask = false;
+                        if (task_to_evaluate.state != WAITING) {
+                            task_to_evaluate.state = WAITING;
+                            task_to_evaluate.next_run = calculateNextRunTime(task_to_evaluate, true);
+                        }
+                        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d (state %d) cannot start/resume, zone %u busy with higher/equal priority task %d. Setting/keeping WAITING.", task_to_evaluate.id, task_to_evaluate.state, zoneId, conflictingTask->id);
                         anyStateChangedThisUpdate = true;
+                        break;
                     }
-                    // next_run will be recalculated when it finishes or is stopped.
                 }
+            } // End zone check loop
+
+            if (canRunThisTask) {
+                for (IrrigationTask* taskToActuallyPause : tasksToPauseForThisEvaluation) {
+                    if (taskToActuallyPause->state == RUNNING) { // Only pause if it's actually running
+                       pauseTask(*taskToActuallyPause);
+                       AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d PAUSED by higher priority task %d.", taskToActuallyPause->id, task_to_evaluate.id);
+                       anyStateChangedThisUpdate = true;
+                    }
+                }
+
+                if (task_to_evaluate.state == PAUSED) {
+                    // Check if its zones are truly free now (i.e. not taken by another higher prio task that just started)
+                    // This check is implicitly done by the canRunThisTask logic above. If we reached here, it means PAUSED task can resume.
+                    resumeTask(task_to_evaluate); 
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d RESUMED.", task_to_evaluate.id);
+                } else { // IDLE or WAITING
+                    TaskState oldState = task_to_evaluate.state;
+                    startTask(task_to_evaluate); 
+                    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d STARTED (from %s).", task_to_evaluate.id, (oldState == IDLE ? "IDLE" : "WAITING"));
+                }
+                task_to_evaluate.state = RUNNING; // Set by startTask or resumeTask, but ensure it's set here.
+                anyStateChangedThisUpdate = true;
             }
-        }
-        
-        // If any task changed state (started, stopped, completed, next_run updated).
+        } // End main task evaluation loop
+
         if (anyStateChangedThisUpdate) {
-            _scheduleStatusChanged = true; // Flag that overall schedule status might have changed.
+            _scheduleStatusChanged = true;
         }
-        
-        // Recompute the earliest next check time after all updates.
         recomputeEarliestNextCheckTime();
-        
         xSemaphoreGive(_mutex);
     }
 }
@@ -629,56 +586,120 @@ bool TaskScheduler::checkSensorConditions(const IrrigationTask& task) {
 }
 
 void TaskScheduler::startTask(IrrigationTask& task) {
-    // Turn ON relays for each zone in the task.
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Attempting to start task %d. Duration: %u mins. Zones: ...", task.id, task.duration);
+    task.start_time = time(NULL);
+    task.is_resuming_from_pause = false; 
+    task.remaining_duration_on_pause_ms = 0; // Ensure this is reset for a fresh start
+    uint32_t duration_ms = task.duration * 60 * 1000;
+
+    String zonesStr = "";
+    for (size_t i = 0; i < task.zones.size(); ++i) {
+        zonesStr += String(task.zones[i]);
+        if (i < task.zones.size() - 1) zonesStr += ", ";
+    }
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d starting with zones: [%s]", task.id, zonesStr.c_str());
+
+
     for (uint8_t zoneId : task.zones) {
-        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) { // Check against actual number of relays
-            uint8_t relayIndex = zoneId - 1; // Convert 1-based zoneId to 0-based relayIndex
-            _relayManager.turnOn(relayIndex, task.duration * 60 * 1000); // Duration to ms for RelayManager timer.
-            
-            _activeZonesBits.set(relayIndex); // Mark this zone (relay index) as active.
+        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
+            uint8_t relayIndex = zoneId - 1;
+            _relayManager.turnOn(relayIndex, duration_ms);
+            _activeZonesBits.set(relayIndex);
         } else {
             AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in startTask for task %d", zoneId, task.id);
         }
     }
-    
-    task.start_time = time(NULL); // Record task start time.
-    
-    String zonesStr = "";
-    for (size_t i = 0; i < task.zones.size(); ++i) {
-        zonesStr += String(task.zones[i]);
-        if (i < task.zones.size() - 1) {
-            zonesStr += ", ";
-        }
-    }
-    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Started irrigation task %d for %u minutes on zones: [%s]", task.id, task.duration, zonesStr.c_str());
+    task.state = RUNNING; // Ensure state is set
 }
 
-void TaskScheduler::stopTask(IrrigationTask& task) {
-    // Turn OFF relays for each zone in the task.
+void TaskScheduler::stopTask(IrrigationTask& task) { // Called when task COMPLETED or is forcefully stopped/cancelled
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Stopping task %d (current state %d). Clearing active zones.", task.id, task.state);
     for (uint8_t zoneId : task.zones) {
         if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
-            uint8_t relayIndex = zoneId - 1; // Convert 1-based zoneId to 0-based relayIndex
+            uint8_t relayIndex = zoneId - 1;
             _relayManager.turnOff(relayIndex);
-            
-            _activeZonesBits.reset(relayIndex); // Mark this zone (relay index) as inactive.
+            _activeZonesBits.reset(relayIndex); 
         } else {
-             AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in stopTask for task %d", zoneId, task.id);
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in stopTask for task %d", zoneId, task.id);
         }
     }
-    
-    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Stopped irrigation task %d", task.id);
+    task.is_resuming_from_pause = false;
+    task.remaining_duration_on_pause_ms = 0;
+    // task.state is typically set to COMPLETED or IDLE by the caller after this.
 }
 
-// Checks if a specific zone (1-based) is currently part of an active (RUNNING) task.
+void TaskScheduler::pauseTask(IrrigationTask& task) {
+    if (task.state != RUNNING) {
+        AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Attempted to pause task %d but it was not RUNNING (state: %d).", task.id, task.state);
+        return;
+    }
+
+    time_t now = time(NULL);
+    time_t elapsed_seconds_before_pause = now - task.start_time;
+    
+    uint32_t original_duration_seconds_this_run;
+    if (task.is_resuming_from_pause) {
+        original_duration_seconds_this_run = task.remaining_duration_on_pause_ms / 1000;
+    } else {
+        original_duration_seconds_this_run = task.duration * 60;
+    }
+    
+    int32_t remaining_sec = original_duration_seconds_this_run - elapsed_seconds_before_pause;
+    task.remaining_duration_on_pause_ms = (remaining_sec > 0) ? (unsigned long)remaining_sec * 1000 : 0;
+
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Pausing task %d. Original duration for this run: %u s. Elapsed: %lld s. Remaining: %lu ms.",
+                   task.id, original_duration_seconds_this_run, elapsed_seconds_before_pause, task.remaining_duration_on_pause_ms);
+
+    for (uint8_t zoneId : task.zones) {
+        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
+            _relayManager.turnOff(zoneId - 1); 
+            // _activeZonesBits.set(zoneId - 1); // Zone bit remains set to reserve it
+        } else {
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in pauseTask for task %d", zoneId, task.id);
+        }
+    }
+    task.state = PAUSED;
+    task.is_resuming_from_pause = false; // It's now paused, not resuming. This flag is for when it *becomes* RUNNING again.
+}
+
+void TaskScheduler::resumeTask(IrrigationTask& task) {
+    if (task.state != PAUSED) {
+         AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Attempted to resume task %d but it was not PAUSED (state: %d).", task.id, task.state);
+        return;
+    }
+    if (task.remaining_duration_on_pause_ms == 0) {
+        AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Task %d was PAUSED but has no remaining duration. Marking COMPLETED.", task.id);
+        stopTask(task); // Clear zone bits etc.
+        task.state = COMPLETED;
+        task.next_run = calculateNextRunTime(task);
+        _scheduleStatusChanged = true;
+        return;
+    }
+
+    AppLogger.logf(LOG_LEVEL_INFO, "TaskSched", "Resuming task %d with %lu ms remaining.", task.id, task.remaining_duration_on_pause_ms);
+    task.start_time = time(NULL); 
+    task.is_resuming_from_pause = true; 
+
+    for (uint8_t zoneId : task.zones) {
+        if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
+            // _activeZonesBits should already be set for these zones
+            _relayManager.turnOn(zoneId - 1, task.remaining_duration_on_pause_ms);
+        } else {
+            AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId %u in resumeTask for task %d", zoneId, task.id);
+        }
+    }
+    task.state = RUNNING;
+}
+
 bool TaskScheduler::isZoneBusy(uint8_t zoneId) {
     if (zoneId >= 1 && zoneId <= _relayManager.getNumRelays()) {
-        return _activeZonesBits.test(zoneId - 1); // Test 0-based index.
+        // Check _activeZonesBits directly, as this should reflect committed zones
+        return _activeZonesBits.test(zoneId - 1);
     }
     AppLogger.logf(LOG_LEVEL_ERROR, "TaskSched", "ERROR: Invalid zoneId in isZoneBusy: %u", zoneId);
-    return false; // Invalid zone ID is considered not busy, or handle error differently.
+    return false;
 }
 
-// Checks if the task with `checkingTaskId` has higher priority than any currently RUNNING task that uses `conflictingZoneId`.
 bool TaskScheduler::isHigherPriority(int checkingTaskId, uint8_t conflictingZoneId) {
     auto checkingTaskIt = std::find_if(_tasks.begin(), _tasks.end(),
                             [checkingTaskId](const IrrigationTask& t) { return t.id == checkingTaskId; });
@@ -709,71 +730,80 @@ bool TaskScheduler::isHigherPriority(int checkingTaskId, uint8_t conflictingZone
     return true; // No higher or equal priority task is running in the conflicting zone.
 }
 
-// Calculates the next run time for a given task.
-// If `isRescheduleAfterSkip` is true, it means the task was just skipped due to conditions/conflicts,
-// so its next run should be the next *valid* slot, not necessarily today if today's slot was missed.
 time_t TaskScheduler::calculateNextRunTime(IrrigationTask& task, bool isRescheduleAfterSkip) {
     time_t now;
     time(&now);
-    struct tm timeinfo_now; // Stores current time details
+    // ... (existing logging for task details) ...
+    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d (State: %d, Active: %s), Days: 0x%02X, Time: %02d:%02d, Skip: %s, Current Epoch: %lu", 
+                    task.id, task.state, task.active ? "T" : "F", task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)now);
+
+
+    if (!task.active) { // If task is inactive, it has no next run time.
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d is inactive. Setting next_run to 0.", task.id);
+        return 0;
+    }
+    if (task.days == 0) { // If task has no scheduled days.
+        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d has no scheduled days (days bitmap is 0). Setting next_run to 0.", task.id);
+        return 0;
+    }
+
+    struct tm timeinfo_now; 
     localtime_r(&now, &timeinfo_now);
 
-    // Log the task details at the beginning of the calculation
-    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "calculateNextRunTime for Task ID: %d, Days Bitmap: 0x%02X, Hour: %d, Minute: %d, isRescheduleAfterSkip: %s, Current Epoch: %lu", 
-                    task.id, task.days, task.hour, task.minute, isRescheduleAfterSkip ? "true" : "false", (unsigned long)now);
-
-    struct tm scheduled_tm = timeinfo_now; // Start with current time structure
-    
-    // Set the scheduled hour and minute from the task.
+    struct tm scheduled_tm = timeinfo_now; 
     scheduled_tm.tm_hour = task.hour;
     scheduled_tm.tm_min = task.minute;
     scheduled_tm.tm_sec = 0;
     
-    // If the task has no scheduled days, it should not have a next_run time.
-    if (task.days == 0) {
-        AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d has no scheduled days (days bitmap is 0). Setting next_run to 0.", task.id);
-        return 0; // Signifies no valid next run time based on days
-    }
-    
-    // Find the next suitable day, starting from today.
-    for (int dayOffset = 0; dayOffset < 8; dayOffset++) { // Check up to 7 days ahead.
-        struct tm nextDayCandidate_tm = timeinfo_now; // Base on current day for offset calculation.
+    for (int dayOffset = 0; dayOffset < 8; dayOffset++) { 
+        struct tm nextDayCandidate_tm = timeinfo_now;
         nextDayCandidate_tm.tm_mday += dayOffset;
-        // Normalize the date (handles month/year rollovers).
-        // Also sets tm_wday and tm_yday correctly for the new date.
         mktime(&nextDayCandidate_tm); 
         
-        // Check if this candidate day is one of the scheduled days for the task.
-        if (task.days & (1 << nextDayCandidate_tm.tm_wday)) { // tm_wday: 0=Sun, ..., 6=Sat.
-            // If it's today (dayOffset == 0) and we are not rescheduling a skipped task,
-            // we need to check if the scheduled time has already passed today.
-            if (dayOffset == 0 && !isRescheduleAfterSkip) {
-                if (timeinfo_now.tm_hour > task.hour || 
-                    (timeinfo_now.tm_hour == task.hour && timeinfo_now.tm_min >= task.minute)) {
-                    // Scheduled time for today has already passed. Look for the next valid day.
-                    continue;
+        if (task.days & (1 << nextDayCandidate_tm.tm_wday)) {
+            // If it's today (dayOffset == 0)
+            if (dayOffset == 0) {
+                // And we are NOT rescheduling a skipped task (i.e., we are calculating for a normal IDLE or COMPLETED task)
+                // AND the scheduled time for today has already passed or is current minute (>=)
+                if (!isRescheduleAfterSkip && 
+                    (timeinfo_now.tm_hour > task.hour || (timeinfo_now.tm_hour == task.hour && timeinfo_now.tm_min >= task.minute))) {
+                    // If task state is IDLE and its time has passed today, it means it was missed. Look for next day.
+                    // If task state is COMPLETED, it means it just finished, so definitely look for next day or later.
+                    // If task.state == RUNNING/PAUSED/WAITING, this 'if' branch implies it's calculating for a future run after it finishes the current cycle/wait.
+                    AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Today's (%s) time %02d:%02d has passed or is current. Skipping to next valid day.", task.id, dayNames[nextDayCandidate_tm.tm_wday], task.hour, task.minute);
+                    continue; 
                 }
             }
-            
-            // Valid day found. Set the task's time to this day.
+            // If isRescheduleAfterSkip is true, it means the task's current slot was missed/skipped.
+            // If dayOffset is 0 (today) and isRescheduleAfterSkip is true, this means we are trying to find the *next* slot,
+            // which could be later today if the task's original time was, say, 10:00, it was skipped, and now it's 10:05.
+            // The mktime normalization and then conversion back should give the correct next instance.
+            // The key is that `isRescheduleAfterSkip` usually implies we *don't* want the immediate past/current slot.
+
             scheduled_tm.tm_year = nextDayCandidate_tm.tm_year;
             scheduled_tm.tm_mon  = nextDayCandidate_tm.tm_mon;
             scheduled_tm.tm_mday = nextDayCandidate_tm.tm_mday;
-            // Hour, minute, second are already set from task's definition.
+            // hour, minute, second are already set
 
-            return mktime(&scheduled_tm); // Convert struct tm to time_t.
+            time_t calculated_time = mktime(&scheduled_tm);
+
+            // If rescheduling a skipped task, and the calculated time is still in the past or *now*, it means
+            // the next slot on this *same day* has also passed. This can happen if a task is skipped multiple times
+            // in quick succession. We need to ensure the returned time is strictly in the future.
+            if (isRescheduleAfterSkip && calculated_time <= now) {
+                 AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Rescheduled time %lu for day %s is still past/present (%lu). Continuing to find future slot.", task.id, (unsigned long)calculated_time, dayNames[nextDayCandidate_tm.tm_wday], (unsigned long)now);
+                continue;
+            }
+            
+            AppLogger.logf(LOG_LEVEL_DEBUG, "TaskSched", "Task %d: Found next run on %s at %02d:%02d. Epoch: %lu", task.id, dayNames[nextDayCandidate_tm.tm_wday], scheduled_tm.tm_hour, scheduled_tm.tm_min, (unsigned long)calculated_time);
+            return calculated_time;
         }
     }
     
-    // If the loop completes, it means no suitable day was found within the next 7-8 days.
-    // This should ideally not happen if task.days is valid and > 0.
-    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task %d: calculateNextRunTime could not find a valid next run day within 7 days, despite task.days=0x%02X. Setting next_run to 0.", task.id, task.days);
-    return 0; // Signifies no valid next run time could be determined
+    AppLogger.logf(LOG_LEVEL_WARNING, "TaskSched", "Task %d: calculateNextRunTime could not find a valid next run day. Setting next_run to 0.", task.id);
+    return 0;
 }
 
-// Converts a JSON array of day numbers (1-7, Mon-Sun or Sun-Sat depending on input convention)
-// to a bitmap (uint8_t) where bit 0 = Sunday, ..., bit 6 = Saturday.
-// Assumes input day numbers are 1=Mon, 2=Tue, ..., 7=Sun for user-friendliness in JSON.
 uint8_t TaskScheduler::daysArrayToBitmap(JsonArray daysArray) {
     uint8_t bitmap = 0;
     
@@ -791,8 +821,6 @@ uint8_t TaskScheduler::daysArrayToBitmap(JsonArray daysArray) {
     return bitmap;
 }
 
-// Converts a days bitmap (bit 0 = Sun, ..., bit 6 = Sat) to a JSON array of day numbers.
-// Outputs day numbers as 1=Mon, 2=Tue, ..., 7=Sun for user-friendly JSON.
 JsonArray TaskScheduler::bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap) {
     JsonArray array = doc.createNestedArray();
     const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}; // For mapping if needed, not directly used for 1-7 numbers
@@ -810,16 +838,12 @@ JsonArray TaskScheduler::bitmapToDaysArray(JsonDocument& doc, uint8_t daysBitmap
     return array;
 }
 
-// Gets the earliest next check time required by any active task.
-// This is used by the main loop to know when to call TaskScheduler::update().
 time_t TaskScheduler::getEarliestNextCheckTime() const {
     // No mutex needed for simple read by Core0, assuming _earliestNextCheckTime updates are atomic enough for this purpose.
     // For more complex scenarios or multi-writer, a mutex might be needed here too.
     return _earliestNextCheckTime;
 }
 
-// Recalculates _earliestNextCheckTime based on all active tasks' next_run times.
-// Should be called whenever tasks are added, updated, deleted, or when a task completes/starts.
 void TaskScheduler::recomputeEarliestNextCheckTime() {
     _earliestNextCheckTime = 0; // Reset to find the minimum.
     time_t now_val;
@@ -846,8 +870,6 @@ void TaskScheduler::recomputeEarliestNextCheckTime() {
     }
 }
 
-// Checks if the schedule status has changed since the last call and resets the flag.
-// Used by the main loop to determine if it needs to publish an updated schedule status via MQTT.
 bool TaskScheduler::hasScheduleStatusChangedAndReset() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY)) {
         bool changed = _scheduleStatusChanged;
@@ -855,8 +877,24 @@ bool TaskScheduler::hasScheduleStatusChangedAndReset() {
         xSemaphoreGive(_mutex);
         return changed;
     }
-    // Fallback if mutex cannot be taken (should not happen with portMAX_DELAY unless an error occurs).
-    // Consider logging an error here.
     AppLogger.error("TaskSched", "Failed to take mutex in hasScheduleStatusChangedAndReset");
     return true; // Default to true to ensure status is sent if mutex fails, to be safe.
-} 
+}
+
+IrrigationTask* TaskScheduler::getTaskUsingZone(uint8_t zoneId, int excludeTaskId) {
+    for (auto& task : _tasks) {
+        if (task.id == excludeTaskId) continue;
+
+        if (task.state == RUNNING || task.state == PAUSED) {
+            for (uint8_t z : task.zones) {
+                if (z == zoneId) {
+                    return &task;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Remove private declaration of checkTasks if it's fully replaced by update()
+// void TaskScheduler::checkTasks() { /* ... */ } // Remove this if not used 

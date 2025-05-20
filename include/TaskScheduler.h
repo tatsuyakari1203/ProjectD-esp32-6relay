@@ -14,7 +14,9 @@
 enum TaskState {
     IDLE,       // Chưa đến giờ chạy
     RUNNING,    // Đang chạy
-    COMPLETED   // Đã hoàn thành
+    COMPLETED,  // Đã hoàn thành
+    PAUSED,     // Was running, but preempted by a higher priority task
+    WAITING     // Scheduled time met, but couldn't run (conflict, conditions), will retry
 };
 
 // Cấu trúc điều kiện cảm biến
@@ -58,11 +60,20 @@ struct IrrigationTask {
     
     // Thông tin trạng thái cơ bản
     TaskState state;            // Trạng thái hiện tại
-    time_t start_time;          // Thời gian bắt đầu thực tế
+    time_t start_time;          // Thời gian bắt đầu thực tế (cho lần chạy hoặc resume gần nhất)
     time_t next_run;            // Thời gian chạy kế tiếp
     
     // Điều kiện cảm biến
     SensorCondition sensor_condition;
+
+    // Fields for preemption and pause/resume
+    bool preemptable;                       // Có thể bị tạm dừng bởi task có độ ưu tiên cao hơn không?
+    unsigned long remaining_duration_on_pause_ms; // Thời gian còn lại (ms) nếu bị tạm dừng
+    bool is_resuming_from_pause;            // Đánh dấu nếu lần chạy hiện tại là resume
+
+    // Constructor to initialize new fields
+    IrrigationTask() : state(IDLE), start_time(0), next_run(0),
+                       preemptable(true), remaining_duration_on_pause_ms(0), is_resuming_from_pause(false) {}
 };
 
 class TaskScheduler {
@@ -96,10 +107,15 @@ private:
     time_t _earliestNextCheckTime;           // Thời điểm sớm nhất cần kiểm tra lại lịch
     bool _scheduleStatusChanged;             // Cờ đánh dấu thay đổi lịch trình
     
+    // Helper methods for starting, stopping, pausing, resuming tasks
+    void startTask(IrrigationTask& task);
+    void stopTask(IrrigationTask& task); // Called when task completes or is forcefully stopped
+    void pauseTask(IrrigationTask& task);
+    void resumeTask(IrrigationTask& task);
+    IrrigationTask* getTaskUsingZone(uint8_t zoneId, int excludeTaskId = -1); // Finds a RUNNING or PAUSED task in a zone
+    
     // Phương thức đơn giản
     void checkTasks();                       // Kiểm tra lịch đến giờ
-    void startTask(IrrigationTask& task);    // Bắt đầu lịch tưới
-    void stopTask(IrrigationTask& task);     // Dừng lịch tưới
     bool isHigherPriority(int checkingTaskId, uint8_t conflictingZoneId);       // Kiểm tra độ ưu tiên
     bool isZoneBusy(uint8_t zoneId);         // Kiểm tra vùng có đang chạy
     time_t calculateNextRunTime(IrrigationTask& task, bool isRescheduleAfterSkip = false); // Tính giờ chạy kế tiếp
